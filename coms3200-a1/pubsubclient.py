@@ -9,6 +9,7 @@ command-line parsing and validation structure for the pubsub client.
 
 import sys
 import socket
+from protocol import make_socket_file, recv_json, send_json
 
 from common import (
     is_printable_message,
@@ -130,9 +131,29 @@ def main() -> None:
     validate_args(parsed)
 
     client_socket = connect_to_server(parsed)
+    sock_file = make_socket_file(client_socket)
 
-    # Temporary output for testing Phase 2B only.
-    print("Connected for testing", flush=True)
+    send_json(
+        client_socket,
+        {
+            "type": "hello_client",
+            "clientid": parsed["client_id"],
+        },
+    )
+
+    response = recv_json(sock_file)
+
+    if response is None or response.get("type") != "hello_ack":
+        endpoint_for_error = normalised_endpoint_for_error(parsed["endpoint_arg"])
+        print(
+            f'pubsubclient: server at "{endpoint_for_error}" is not a valid server',
+            file=sys.stderr,
+            flush=True,
+        )
+        client_socket.close()
+        sys.exit(8)
+
+    print("Handshake OK for testing", flush=True)
 
     client_socket.close()
 

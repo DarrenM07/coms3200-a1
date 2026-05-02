@@ -10,8 +10,10 @@ command-line parsing, validation, and TCP listening structure for the pubsub ser
 import socket
 import sys
 import time
+import threading
 
 from common import is_valid_id, parse_endpoint
+from protocol import make_socket_file, recv_json, send_json
 
 
 USAGE = "Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid"
@@ -120,6 +122,42 @@ def create_listening_socket(listen_port: str | None) -> socket.socket:
 
     return server_socket
 
+def handle_connection(client_socket: socket.socket, server_id: str) -> None:
+    """Handle one incoming connection."""
+    try:
+        sock_file = make_socket_file(client_socket)
+        message = recv_json(sock_file)
+
+        if message is None or message.get("type") != "hello_client":
+            print(
+                "pubsubserver: Connection with unknown client aborted",
+                file=sys.stderr,
+                flush=True,
+            )
+            client_socket.close()
+            return
+
+        client_id = message.get("clientid")
+
+        send_json(
+            client_socket,
+            {
+                "type": "hello_ack",
+                "serverid": server_id,
+            },
+        )
+
+        print(f'pubsubserver: Client "{client_id}" has connected', flush=True)
+
+        client_socket.close()
+
+    except (OSError, ValueError):
+        print(
+            "pubsubserver: Connection with unknown client aborted",
+            file=sys.stderr,
+            flush=True,
+        )
+        client_socket.close()
 
 def main() -> None:
     """Run the pubsub server."""
@@ -133,7 +171,13 @@ def main() -> None:
 
     try:
         while True:
-            time.sleep(1)
+            client_socket, _ = server_socket.accept()
+            thread = threading.Thread(
+                target=handle_connection,
+                args=(client_socket, parsed["server_id"]),
+                daemon=True,
+            )
+            thread.start()
     except KeyboardInterrupt:
         server_socket.close()
         sys.exit(0)
