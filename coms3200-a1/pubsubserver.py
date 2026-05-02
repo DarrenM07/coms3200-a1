@@ -4,10 +4,12 @@
 @ai Wrote Code
 @aitool ChatGPT
 @aidetails ChatGPT was used to help design and implement the initial
-command-line parsing and validation structure for the pubsub server.
+command-line parsing, validation, and TCP listening structure for the pubsub server.
 """
 
+import socket
 import sys
+import time
 
 from common import is_valid_id, parse_endpoint
 
@@ -22,12 +24,7 @@ def usage_error() -> None:
 
 
 def parse_args(argv: list[str]) -> dict:
-    """
-    Parse pubsubserver command-line arguments.
-
-    Expected:
-    pubsubserver [--server [server]:port]... [--listenon port] serverid
-    """
+    """Parse pubsubserver command-line arguments."""
     args = argv[1:]
     peer_args = []
     listen_port = None
@@ -94,14 +91,52 @@ def validate_args(parsed: dict) -> None:
         sys.exit(2)
 
 
+def create_listening_socket(listen_port: str | None) -> socket.socket:
+    """
+    Create and return a TCP listening socket.
+
+    If listen_port is None, bind to port 0 so the OS chooses a free port.
+    """
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        port_to_bind = 0 if listen_port is None else int(listen_port)
+    except ValueError:
+        server_socket.close()
+        print(f'pubsubserver: can’t listen on port "{listen_port}"', file=sys.stderr, flush=True)
+        sys.exit(3)
+
+    try:
+        server_socket.bind(("", port_to_bind))
+        server_socket.listen()
+    except OSError:
+        server_socket.close()
+        if listen_port is None:
+            print('pubsubserver: can’t listen on port "0"', file=sys.stderr, flush=True)
+        else:
+            print(f'pubsubserver: can’t listen on port "{listen_port}"', file=sys.stderr, flush=True)
+        sys.exit(3)
+
+    return server_socket
+
+
 def main() -> None:
     """Run the pubsub server."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
 
-    # Temporary output for testing Phase 1D only.
-    # We will remove this when implementing socket listening.
-    print(parsed)
+    server_socket = create_listening_socket(parsed["listen_port"])
+    actual_port = server_socket.getsockname()[1]
+
+    print(f"pubsubserver: listening on port {actual_port}", file=sys.stderr, flush=True)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        server_socket.close()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
