@@ -8,6 +8,7 @@ command-line parsing and validation structure for the pubsub client.
 """
 
 import sys
+import socket
 
 from common import (
     is_printable_message,
@@ -104,14 +105,36 @@ def validate_args(parsed: dict) -> None:
         sys.exit(6)
 
 
+def connect_to_server(parsed: dict) -> socket.socket:
+    """Connect to the pubsub server or exit with status 7."""
+    endpoint_for_error = normalised_endpoint_for_error(parsed["endpoint_arg"])
+
+    try:
+        client_socket = socket.create_connection(
+            (parsed["host"], int(parsed["port"])),
+            timeout=1.0,
+        )
+    except (OSError, ValueError):
+        print(
+            f'pubsubclient: unable to connect to "{endpoint_for_error}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(7)
+
+    return client_socket
+
 def main() -> None:
     """Run the pubsub client."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
 
-    # Temporary output for testing Phase 1C only.
-    # We will remove this when implementing socket connection.
-    print(parsed)
+    client_socket = connect_to_server(parsed)
+
+    # Temporary output for testing Phase 2B only.
+    print("Connected for testing", flush=True)
+
+    client_socket.close()
 
 
 if __name__ == "__main__":
