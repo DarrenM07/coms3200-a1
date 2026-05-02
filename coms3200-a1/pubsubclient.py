@@ -163,11 +163,34 @@ def main() -> None:
         client_socket.close()
         sys.exit(8)
 
-    print("Handshake OK for testing", flush=True)
+    print("Welcome to pubsubclient!", flush=True)
 
     try:
         while True:
-            pass
+            line = sys.stdin.readline()
+
+            # EOF detected
+            if line == "":
+                client_socket.close()
+                sys.exit(0)
+
+            line = line.strip()
+
+            # ignore empty lines
+            if line == "":
+                continue
+
+            # handle commands
+            if line.startswith("/"):
+                if line == "/quit":
+                    client_socket.close()
+                    sys.exit(0)
+                else:
+                    print("pubsubclient: unknown command", file=sys.stderr, flush=True)
+            else:
+                # message without default topic (for now)
+                print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
+
     except KeyboardInterrupt:
         client_socket.close()
         sys.exit(0)
