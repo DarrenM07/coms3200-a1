@@ -143,6 +143,16 @@ def main() -> None:
 
     response = recv_json(sock_file)
 
+    if response is not None and response.get("type") == "error":
+        if response.get("code") == "duplicate_client_id":
+            print(
+                f'pubsubclient: client ID "{parsed["client_id"]}" is not unique',
+                file=sys.stderr,
+                flush=True,
+            )
+            client_socket.close()
+            sys.exit(9)
+
     if response is None or response.get("type") != "hello_ack":
         endpoint_for_error = normalised_endpoint_for_error(parsed["endpoint_arg"])
         print(
@@ -155,8 +165,12 @@ def main() -> None:
 
     print("Handshake OK for testing", flush=True)
 
-    client_socket.close()
-
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        client_socket.close()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

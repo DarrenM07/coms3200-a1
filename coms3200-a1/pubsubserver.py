@@ -17,7 +17,8 @@ from protocol import make_socket_file, recv_json, send_json
 
 
 USAGE = "Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid"
-
+clients = {}
+clients_lock = threading.Lock()
 
 def usage_error() -> None:
     """Print the server usage error and exit."""
@@ -123,7 +124,9 @@ def create_listening_socket(listen_port: str | None) -> socket.socket:
     return server_socket
 
 def handle_connection(client_socket: socket.socket, server_id: str) -> None:
-    """Handle one incoming connection."""
+    """Handle one incoming client connection."""
+    client_id = None
+
     try:
         sock_file = make_socket_file(client_socket)
         message = recv_json(sock_file)
@@ -139,6 +142,24 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         client_id = message.get("clientid")
 
+        with clients_lock:
+            if client_id in clients:
+                print(
+                    f'pubsubserver: Client ID "{client_id}" would be duplicated - aborting connection',
+                    flush=True,
+                )
+                send_json(
+                    client_socket,
+                    {
+                        "type": "error",
+                        "code": "duplicate_client_id",
+                    },
+                )
+                client_socket.close()
+                return
+
+            clients[client_id] = client_socket
+
         send_json(
             client_socket,
             {
@@ -149,14 +170,21 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         print(f'pubsubserver: Client "{client_id}" has connected', flush=True)
 
-        client_socket.close()
+        while True:
+            next_message = recv_json(sock_file)
+            if next_message is None:
+                break
 
     except (OSError, ValueError):
-        print(
-            "pubsubserver: Connection with unknown client aborted",
-            file=sys.stderr,
-            flush=True,
-        )
+        pass
+
+    finally:
+        if client_id is not None:
+            with clients_lock:
+                if clients.get(client_id) is client_socket:
+                    del clients[client_id]
+                    print(f'pubsubserver: Client "{client_id}" has disconnected', flush=True)
+
         client_socket.close()
 
 def main() -> None:
