@@ -1,0 +1,13 @@
+Usage: pubsubclient [--topic topic] [server]:port clientid [message]
+Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid
+Welcome to pubsubclient!
+
+pubsubclient: unknown command
+pubsubclient: no default topic set
+pubsubclient: messages must only contain printable characters
+pubsubclient: server disconnected - exiting
+pubsubclient: exiting due to server shutdown
+
+pubsubserver: unknown command
+pubsubserver: No clients connected
+pubsubserver: No peer servers connected

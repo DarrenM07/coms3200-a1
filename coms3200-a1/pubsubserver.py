@@ -1,9 +1,7 @@
 """! @file pubsubserver.py
 @author Darren
 @ai Inspiration
-@ai Wrote Comments
 @aitool ChatGPT
-@aidetails ChatGPT was used to help plan the program structure,
-design the initial protocol, and explain implementation steps.
-All code was reviewed and adapted by the student.
+@aidetails ChatGPT was used to help understand the assignment specification,
+plan the program structure, and design the initial implementation roadmap.
 """
