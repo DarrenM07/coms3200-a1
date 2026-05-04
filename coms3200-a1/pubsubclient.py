@@ -180,16 +180,43 @@ def main() -> None:
             if line == "":
                 continue
 
-            # handle commands
             if line.startswith("/"):
                 if line == "/quit":
                     client_socket.close()
                     sys.exit(0)
+
+                elif line.startswith("/topic"):
+                    parts = line.split(maxsplit=1)
+
+                    if len(parts) != 2 or parts[1] == "":
+                        print(
+                            "pubsubclient: unknown argument(s) - usage: /topic topic",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+
+                    topic = parts[1]
+
+                    if not is_valid_topic(topic):
+                        print(
+                            f'pubsubclient: invalid topic string "{topic}"',
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+
+                    parsed["default_topic"] = topic
+
                 else:
                     print("pubsubclient: unknown command", file=sys.stderr, flush=True)
+
             else:
-                # message without default topic (for now)
-                print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
+                if parsed["default_topic"] is None:
+                    print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
+                else:
+                    # Temporary until publish is implemented.
+                    pass
 
     except KeyboardInterrupt:
         client_socket.close()
