@@ -12,7 +12,7 @@ import sys
 import time
 import threading
 
-from common import is_valid_id, parse_endpoint
+from common import filter_matches_message, is_valid_id, parse_endpoint
 from protocol import make_socket_file, recv_json, send_json
 
 
@@ -180,11 +180,17 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
             if next_message.get("type") == "subscribe":
                 topic = next_message.get("topic")
+                filter_data = next_message.get("filter")
+
+                subscription = {
+                    "topic": topic,
+                    "filter": filter_data,
+                }
 
                 with clients_lock:
                     client_subs = subscriptions.setdefault(client_id, [])
-                    if topic not in client_subs:
-                        client_subs.append(topic)
+                    if subscription not in client_subs:
+                        client_subs.append(subscription)
 
                 continue
 
@@ -194,9 +200,9 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 with clients_lock:
                     client_subs = subscriptions.setdefault(client_id, [])
                     subscriptions[client_id] = [
-                        existing_topic
-                        for existing_topic in client_subs
-                        if existing_topic != topic
+                        existing_subscription
+                        for existing_subscription in client_subs
+                        if existing_subscription["topic"] != topic
                     ]
 
                 continue
@@ -206,11 +212,26 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 publish_message = next_message.get("message")
 
                 with clients_lock:
-                    target_sockets = [
-                        sock
-                        for subscriber_id, sock in clients.items()
-                        if topic in subscriptions.get(subscriber_id, [])
-                    ]
+                    target_sockets = []
+
+                    for subscriber_id, sock in clients.items():
+                        for subscription in subscriptions.get(subscriber_id, []):
+                            if subscription["topic"] != topic:
+                                continue
+
+                            filter_data = subscription["filter"]
+
+                            if filter_data is None:
+                                target_sockets.append(sock)
+                                break
+
+                            if filter_matches_message(
+                                publish_message,
+                                filter_data["operator"],
+                                filter_data["value"],
+                            ):
+                                target_sockets.append(sock)
+                                break
 
                 for target_socket in target_sockets:
                     try:

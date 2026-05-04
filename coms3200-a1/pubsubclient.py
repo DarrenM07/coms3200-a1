@@ -18,6 +18,7 @@ from common import (
     is_valid_topic,
     normalised_endpoint_for_error,
     parse_endpoint,
+    parse_filter,
 )
 from protocol import make_socket_file, recv_json, send_json
 
@@ -309,19 +310,53 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
         client_socket.close()
         sys.exit(0)
 
-def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
-    """Handle /subscribe command without filter for now."""
-    parts = line.split(maxsplit=1)
+def parse_subscribe_line(line: str) -> tuple[str, str | None]:
+    """Parse /subscribe topic [filter] with simple quote support."""
+    rest = line[len("/subscribe"):].strip()
 
-    if len(parts) != 2 or parts[1] == "":
+    if rest == "":
+        raise ValueError("usage")
+
+    if rest.startswith('"'):
+        closing = rest.find('"', 1)
+        if closing == -1:
+            raise ValueError("usage")
+        topic = rest[1:closing]
+        remaining = rest[closing + 1:].strip()
+    else:
+        parts = rest.split(maxsplit=1)
+        topic = parts[0]
+        remaining = parts[1].strip() if len(parts) == 2 else ""
+
+    if topic == "":
+        raise ValueError("usage")
+
+    if remaining == "":
+        return topic, None
+
+    if remaining.startswith('"'):
+        if not remaining.endswith('"') or len(remaining) < 2:
+            raise ValueError("usage")
+        filter_raw = remaining[1:-1]
+    else:
+        filter_raw = remaining
+
+    if filter_raw == "":
+        raise ValueError("usage")
+
+    return topic, filter_raw
+
+def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
+    """Handle /subscribe command with optional filter."""
+    try:
+        topic, filter_raw = parse_subscribe_line(line)
+    except ValueError:
         print(
             "pubsubclient: unknown argument(s) - usage: /subscribe topic [filter]",
             file=sys.stderr,
             flush=True,
         )
         return
-
-    topic = parts[1]
 
     if not is_valid_topic(topic):
         print(
@@ -331,11 +366,44 @@ def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.sock
         )
         return
 
-    subscription = {"topic": topic, "filter_raw": None}
+    filter_data = None
 
-    if subscription in parsed["subscriptions"]:
-        print("pubsubclient: identical subscription ignored", file=sys.stderr, flush=True)
-        return
+    if filter_raw is not None:
+        try:
+            operator, value = parse_filter(filter_raw)
+        except ValueError:
+            print(
+                f'pubsubclient: invalid filter string "{filter_raw}"',
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        filter_data = {
+            "operator": operator,
+            "value": value,
+        }
+
+    subscription = {
+        "topic": topic,
+        "filter_raw": filter_raw,
+        "filter_data": filter_data,
+    }
+
+    for existing in parsed["subscriptions"]:
+        same_topic = existing["topic"] == topic
+        same_filter_absence = existing["filter_raw"] is None and filter_raw is None
+
+        same_filter_value = False
+        if existing["filter_data"] is not None and filter_data is not None:
+            same_filter_value = (
+                existing["filter_data"]["operator"] == filter_data["operator"]
+                and existing["filter_data"]["value"] == filter_data["value"]
+            )
+
+        if same_topic and (same_filter_absence or same_filter_value):
+            print("pubsubclient: identical subscription ignored", file=sys.stderr, flush=True)
+            return
 
     parsed["subscriptions"].append(subscription)
 
@@ -344,7 +412,8 @@ def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.sock
         {
             "type": "subscribe",
             "topic": topic,
-            "filter": None,
+            "filter": filter_data,
+            "filter_raw": filter_raw,
         },
     )
 
