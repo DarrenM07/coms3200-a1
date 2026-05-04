@@ -175,6 +175,10 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
             if next_message is None:
                 break
 
+            if next_message.get("type") == "publish":
+                # Publishing will be forwarded to matching subscribers in the next phase.
+                continue
+
     except (OSError, ValueError):
         pass
 

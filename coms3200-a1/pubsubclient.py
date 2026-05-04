@@ -4,20 +4,21 @@
 @ai Wrote Code
 @aitool ChatGPT
 @aidetails ChatGPT was used to help design and implement the initial
-command-line parsing and validation structure for the pubsub client.
+command-line parsing, validation, TCP connection, handshake, interactive mode,
+default topic command, and publish message handling for the pubsub client.
 """
 
-import sys
 import socket
-from protocol import make_socket_file, recv_json, send_json
+import sys
 
 from common import (
     is_printable_message,
     is_valid_id,
     is_valid_topic,
-    parse_endpoint,
     normalised_endpoint_for_error,
+    parse_endpoint,
 )
+from protocol import make_socket_file, recv_json, send_json
 
 
 USAGE = "Usage: pubsubclient [--topic topic] [server]:port clientid [message]"
@@ -125,12 +126,9 @@ def connect_to_server(parsed: dict) -> socket.socket:
 
     return client_socket
 
-def main() -> None:
-    """Run the pubsub client."""
-    parsed = parse_args(sys.argv)
-    validate_args(parsed)
 
-    client_socket = connect_to_server(parsed)
+def perform_handshake(client_socket: socket.socket, parsed: dict):
+    """Perform initial client-server handshake."""
     sock_file = make_socket_file(client_socket)
 
     send_json(
@@ -163,64 +161,163 @@ def main() -> None:
         client_socket.close()
         sys.exit(8)
 
+    return sock_file
+
+
+def handle_topic_command(line: str, parsed: dict) -> None:
+    """Handle /topic command."""
+    parts = line.split(maxsplit=1)
+
+    if len(parts) != 2 or parts[1] == "":
+        print(
+            "pubsubclient: unknown argument(s) - usage: /topic topic",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    topic = parts[1]
+
+    if not is_valid_topic(topic):
+        print(
+            f'pubsubclient: invalid topic string "{topic}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    parsed["default_topic"] = topic
+
+
+def handle_publish_command(line: str, client_socket: socket.socket) -> None:
+    """Handle /publish command."""
+    parts = line.split(maxsplit=2)
+
+    if len(parts) != 3 or parts[1] == "" or parts[2] == "":
+        print(
+            "pubsubclient: unknown argument(s) - usage: /publish topic message",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    topic = parts[1]
+    message = parts[2]
+
+    if not is_valid_topic(topic):
+        print(
+            f'pubsubclient: invalid topic string "{topic}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    if not is_printable_message(message):
+        print(
+            "pubsubclient: messages must only contain printable characters",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    send_json(
+        client_socket,
+        {
+            "type": "publish",
+            "topic": topic,
+            "message": message,
+        },
+    )
+
+
+def handle_default_message(line: str, parsed: dict, client_socket: socket.socket) -> None:
+    """Publish a normal input line using the default topic."""
+    if parsed["default_topic"] is None:
+        print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
+        return
+
+    if not is_printable_message(line):
+        print(
+            "pubsubclient: messages must only contain printable characters",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    send_json(
+        client_socket,
+        {
+            "type": "publish",
+            "topic": parsed["default_topic"],
+            "message": line,
+        },
+    )
+
+
+def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
+    """Run the client interactive input loop."""
     print("Welcome to pubsubclient!", flush=True)
 
     try:
         while True:
             line = sys.stdin.readline()
 
-            # EOF detected
             if line == "":
                 client_socket.close()
                 sys.exit(0)
 
-            line = line.strip()
+            line = line.rstrip("\n")
 
-            # ignore empty lines
-            if line == "":
+            if line.strip() == "":
                 continue
 
-            if line.startswith("/"):
-                if line == "/quit":
+            stripped = line.strip()
+
+            if stripped.startswith("/"):
+                if stripped == "/quit":
                     client_socket.close()
                     sys.exit(0)
 
-                elif line.startswith("/topic"):
-                    parts = line.split(maxsplit=1)
+                if stripped.startswith("/topic"):
+                    handle_topic_command(stripped, parsed)
+                    continue
 
-                    if len(parts) != 2 or parts[1] == "":
-                        print(
-                            "pubsubclient: unknown argument(s) - usage: /topic topic",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
+                if stripped.startswith("/publish"):
+                    handle_publish_command(stripped, client_socket)
+                    continue
 
-                    topic = parts[1]
+                print("pubsubclient: unknown command", file=sys.stderr, flush=True)
+                continue
 
-                    if not is_valid_topic(topic):
-                        print(
-                            f'pubsubclient: invalid topic string "{topic}"',
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-
-                    parsed["default_topic"] = topic
-
-                else:
-                    print("pubsubclient: unknown command", file=sys.stderr, flush=True)
-
-            else:
-                if parsed["default_topic"] is None:
-                    print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
-                else:
-                    # Temporary until publish is implemented.
-                    pass
+            handle_default_message(line, parsed, client_socket)
 
     except KeyboardInterrupt:
         client_socket.close()
         sys.exit(0)
+
+
+def main() -> None:
+    """Run the pubsub client."""
+    parsed = parse_args(sys.argv)
+    validate_args(parsed)
+
+    client_socket = connect_to_server(parsed)
+    perform_handshake(client_socket, parsed)
+
+    if parsed["message"] is not None:
+        send_json(
+            client_socket,
+            {
+                "type": "publish",
+                "topic": parsed["default_topic"],
+                "message": parsed["message"],
+            },
+        )
+        client_socket.close()
+        sys.exit(0)
+
+    interactive_loop(client_socket, parsed)
+
 
 if __name__ == "__main__":
     main()
