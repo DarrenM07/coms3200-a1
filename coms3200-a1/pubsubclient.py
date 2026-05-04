@@ -280,8 +280,12 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     client_socket.close()
                     sys.exit(0)
 
+                if stripped == "/listsubs":
+                    handle_listsubs_command(parsed)
+                    continue
+
                 if stripped.startswith("/subscribe"):
-                    handle_subscribe_command(stripped, client_socket)
+                    handle_subscribe_command(stripped, parsed, client_socket)
                     continue
 
                 if stripped.startswith("/topic"):
@@ -301,7 +305,7 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
         client_socket.close()
         sys.exit(0)
 
-def handle_subscribe_command(line: str, client_socket: socket.socket) -> None:
+def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
     """Handle /subscribe command without filter for now."""
     parts = line.split(maxsplit=1)
 
@@ -322,6 +326,14 @@ def handle_subscribe_command(line: str, client_socket: socket.socket) -> None:
             flush=True,
         )
         return
+
+    subscription = {"topic": topic, "filter_raw": None}
+
+    if subscription in parsed["subscriptions"]:
+        print("pubsubclient: identical subscription ignored", file=sys.stderr, flush=True)
+        return
+
+    parsed["subscriptions"].append(subscription)
 
     send_json(
         client_socket,
@@ -361,11 +373,33 @@ def server_reader_loop(sock_file) -> None:
         )
         sys.exit(10)
 
+def quote_if_needed(value: str) -> str:
+    """Quote a value if it contains whitespace."""
+    if any(char.isspace() for char in value):
+        return f'"{value}"'
+    return value
+
+
+def handle_listsubs_command(parsed: dict) -> None:
+    """Handle /listsubs command."""
+    if not parsed["subscriptions"]:
+        print("No subscriptions", flush=True)
+        return
+
+    for subscription in parsed["subscriptions"]:
+        topic = quote_if_needed(subscription["topic"])
+
+        if subscription["filter_raw"] is None:
+            print(f"/subscribe {topic}", flush=True)
+        else:
+            filter_raw = quote_if_needed(subscription["filter_raw"])
+            print(f"/subscribe {topic} {filter_raw}", flush=True)
 
 def main() -> None:
     """Run the pubsub client."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
+    parsed["subscriptions"] = []
 
     client_socket = connect_to_server(parsed)
     sock_file = perform_handshake(client_socket, parsed)
