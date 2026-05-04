@@ -290,6 +290,10 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     handle_unsubscribe_command(stripped, parsed, client_socket)
                     continue
 
+                if stripped == "/listlimits":
+                    handle_listlimits_command(parsed)
+                    continue
+
                 if stripped == "/listclients":
                     handle_listclients_command(client_socket)
                     continue
@@ -429,7 +433,7 @@ def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.sock
         },
     )
 
-def server_reader_loop(sock_file) -> None:
+def server_reader_loop(sock_file, parsed: dict) -> None:
     """Read and print messages delivered from the server."""
     try:
         while True:
@@ -467,6 +471,40 @@ def server_reader_loop(sock_file) -> None:
                 else:
                     for peer in sorted(peers):
                         print(peer, flush=True)
+
+            elif message.get("type") == "rate_limit_notice":
+                topic = message["topic"]
+                limit = message["limit"]
+
+                existing = None
+                for item in parsed["rate_limits"]:
+                    if item["client_id"] == parsed["client_id"] and item["topic"] == topic:
+                        existing = item
+                        break
+
+                if existing is None:
+                    parsed["rate_limits"].append(
+                        {
+                            "client_id": parsed["client_id"],
+                            "topic": topic,
+                            "limit": limit,
+                        }
+                    )
+                else:
+                    existing["limit"] = limit
+
+                print(
+                    f'pubsubclient: you are rate limited on topic "{topic}" '
+                    f'to {limit} seconds between messages',
+                    flush=True,
+                )
+
+            elif message.get("type") == "rate_limit_failed":
+                print(
+                    "pubsubclient: message publication failed due to rate limit",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     except (OSError, ValueError):
         print(
@@ -562,11 +600,22 @@ def handle_listclients_command(client_socket: socket.socket) -> None:
 def handle_listpeers_command(client_socket: socket.socket) -> None:
     send_json(client_socket, {"type": "listpeers"})
 
+def handle_listlimits_command(parsed: dict) -> None:
+    """Handle /listlimits command."""
+    if not parsed["rate_limits"]:
+        print("No limits", flush=True)
+        return
+
+    for limit in parsed["rate_limits"]:
+        topic = quote_if_needed(limit["topic"])
+        print(f'/limit {limit["client_id"]} {topic} {limit["limit"]}', flush=True)
+
 def main() -> None:
     """Run the pubsub client."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
     parsed["subscriptions"] = []
+    parsed["rate_limits"] = []
 
     client_socket = connect_to_server(parsed)
     sock_file = perform_handshake(client_socket, parsed)
@@ -585,7 +634,7 @@ def main() -> None:
 
     reader_thread = threading.Thread(
         target=server_reader_loop,
-        args=(sock_file,),
+        args=(sock_file, parsed),
         daemon=True,
     )
     reader_thread.start()

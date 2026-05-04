@@ -19,6 +19,8 @@ from protocol import make_socket_file, recv_json, send_json
 USAGE = "Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid"
 clients = {}
 subscriptions = {}
+rate_limits = {}
+last_publish_times = {}
 clients_lock = threading.Lock()
 
 def usage_error() -> None:
@@ -234,6 +236,36 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 topic = next_message.get("topic")
                 publish_message = next_message.get("message")
 
+                limit_key = (client_id, topic)
+                now = time.time()
+
+                with clients_lock:
+                    limit_seconds = rate_limits.get(limit_key, 0)
+                    last_time = last_publish_times.get(limit_key)
+
+                    if (
+                        limit_seconds > 0
+                        and last_time is not None
+                        and now - last_time < limit_seconds
+                    ):
+                        rate_limited = True
+                    else:
+                        rate_limited = False
+                        if limit_seconds > 0:
+                            last_publish_times[limit_key] = now
+
+                if rate_limited:
+                    try:
+                        send_json(
+                            client_socket,
+                            {
+                                "type": "rate_limit_failed",
+                            },
+                        )
+                    except OSError:
+                        pass
+                    continue
+
                 with clients_lock:
                     target_sockets = []
 
@@ -286,6 +318,94 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         client_socket.close()
 
+def server_stdin_loop() -> None:
+    """Handle server commands from stdin."""
+    while True:
+        line = sys.stdin.readline()
+
+        if line == "":
+            # EOF behaves like /quit later. For now, just exit.
+            sys.exit(0)
+
+        line = line.strip()
+
+        if line == "":
+            continue
+
+        if line.startswith("/limit"):
+            parts = line.split(maxsplit=3)
+
+            if len(parts) != 4:
+                print(
+                    "pubsubserver: unknown argument(s) - usage: /limit clientid topic N",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            client_id = parts[1]
+            topic = parts[2]
+            limit_raw = parts[3]
+
+            with clients_lock:
+                client_socket = clients.get(client_id)
+
+            if client_socket is None or not is_valid_id(client_id):
+                print(
+                    f'pubsubserver: Client "{client_id}" is unknown',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            from common import is_valid_topic
+
+            if not is_valid_topic(topic):
+                print(
+                    f'pubsubserver: Topic "{topic}" is not valid',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            try:
+                limit_seconds = int(limit_raw)
+            except ValueError:
+                print(
+                    "pubsubserver: Rate limit must be 0 to 3600 seconds inclusive",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            if limit_seconds < 0 or limit_seconds > 3600:
+                print(
+                    "pubsubserver: Rate limit must be 0 to 3600 seconds inclusive",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            with clients_lock:
+                rate_limits[(client_id, topic)] = limit_seconds
+                last_publish_times.pop((client_id, topic), None)
+
+            try:
+                send_json(
+                    client_socket,
+                    {
+                        "type": "rate_limit_notice",
+                        "topic": topic,
+                        "limit": limit_seconds,
+                    },
+                )
+            except OSError:
+                pass
+
+            continue
+
+        print("pubsubserver: unknown command", file=sys.stderr, flush=True)
+
 def main() -> None:
     """Run the pubsub server."""
     parsed = parse_args(sys.argv)
@@ -295,6 +415,8 @@ def main() -> None:
     actual_port = server_socket.getsockname()[1]
 
     print(f"pubsubserver: listening on port {actual_port}", file=sys.stderr, flush=True)
+    stdin_thread = threading.Thread(target=server_stdin_loop, daemon=True)
+    stdin_thread.start()
 
     try:
         while True:
