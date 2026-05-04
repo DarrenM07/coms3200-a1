@@ -284,6 +284,10 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     handle_listsubs_command(parsed)
                     continue
 
+                if stripped.startswith("/unsubscribe"):
+                    handle_unsubscribe_command(stripped, parsed, client_socket)
+                    continue
+
                 if stripped.startswith("/subscribe"):
                     handle_subscribe_command(stripped, parsed, client_socket)
                     continue
@@ -379,7 +383,6 @@ def quote_if_needed(value: str) -> str:
         return f'"{value}"'
     return value
 
-
 def handle_listsubs_command(parsed: dict) -> None:
     """Handle /listsubs command."""
     if not parsed["subscriptions"]:
@@ -394,6 +397,58 @@ def handle_listsubs_command(parsed: dict) -> None:
         else:
             filter_raw = quote_if_needed(subscription["filter_raw"])
             print(f"/subscribe {topic} {filter_raw}", flush=True)
+
+def handle_unsubscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
+    """Handle /unsubscribe command."""
+    parts = line.split(maxsplit=1)
+
+    if len(parts) != 2 or parts[1] == "":
+        print(
+            "pubsubclient: unknown argument(s) - usage: /unsubscribe topic",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    topic = parts[1]
+
+    if not is_valid_topic(topic):
+        print(
+            f'pubsubclient: invalid topic string "{topic}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    existing = [
+        subscription
+        for subscription in parsed["subscriptions"]
+        if subscription["topic"] == topic
+    ]
+
+    if not existing:
+        print(
+            f'pubsubclient: not subscribed to messages about "{topic}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    parsed["subscriptions"] = [
+        subscription
+        for subscription in parsed["subscriptions"]
+        if subscription["topic"] != topic
+    ]
+
+    send_json(
+        client_socket,
+        {
+            "type": "unsubscribe",
+            "topic": topic,
+        },
+    )
+
+    print(f'pubsubclient: unsubscribed from messages about "{topic}"', flush=True)
 
 def main() -> None:
     """Run the pubsub client."""

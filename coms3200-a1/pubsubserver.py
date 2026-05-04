@@ -188,6 +188,19 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
                 continue
 
+            if next_message.get("type") == "unsubscribe":
+                topic = next_message.get("topic")
+
+                with clients_lock:
+                    client_subs = subscriptions.setdefault(client_id, [])
+                    subscriptions[client_id] = [
+                        existing_topic
+                        for existing_topic in client_subs
+                        if existing_topic != topic
+                    ]
+
+                continue
+
             if next_message.get("type") == "publish":
                 topic = next_message.get("topic")
                 publish_message = next_message.get("message")
