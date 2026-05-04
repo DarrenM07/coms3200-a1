@@ -11,6 +11,7 @@ default topic command, and publish message handling for the pubsub client.
 import socket
 import sys
 import threading
+import shlex
 
 from common import (
     is_printable_message,
@@ -169,9 +170,9 @@ def perform_handshake(client_socket: socket.socket, parsed: dict):
 
 def handle_topic_command(line: str, parsed: dict) -> None:
     """Handle /topic command."""
-    parts = line.split(maxsplit=1)
+    args = parse_command_args(line)
 
-    if len(parts) != 2 or parts[1] == "":
+    if args is None or len(args) != 2:
         print(
             "pubsubclient: unknown argument(s) - usage: /topic topic",
             file=sys.stderr,
@@ -179,7 +180,7 @@ def handle_topic_command(line: str, parsed: dict) -> None:
         )
         return
 
-    topic = parts[1]
+    topic = args[1]
 
     if not is_valid_topic(topic):
         print(
@@ -194,9 +195,9 @@ def handle_topic_command(line: str, parsed: dict) -> None:
 
 def handle_publish_command(line: str, client_socket: socket.socket) -> None:
     """Handle /publish command."""
-    parts = line.split(maxsplit=2)
+    args = parse_command_args(line)
 
-    if len(parts) != 3 or parts[1] == "" or parts[2] == "":
+    if args is None or len(args) != 3:
         print(
             "pubsubclient: unknown argument(s) - usage: /publish topic message",
             file=sys.stderr,
@@ -204,8 +205,8 @@ def handle_publish_command(line: str, client_socket: socket.socket) -> None:
         )
         return
 
-    topic = parts[1]
-    message = parts[2]
+    topic = args[1]
+    message = args[2]
 
     if not is_valid_topic(topic):
         print(
@@ -348,15 +349,18 @@ def parse_subscribe_line(line: str) -> tuple[str, str | None]:
 
 def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
     """Handle /subscribe command with optional filter."""
-    try:
-        topic, filter_raw = parse_subscribe_line(line)
-    except ValueError:
+    args = parse_command_args(line)
+
+    if args is None or len(args) not in (2, 3):
         print(
             "pubsubclient: unknown argument(s) - usage: /subscribe topic [filter]",
             file=sys.stderr,
             flush=True,
         )
         return
+
+    topic = args[1]
+    filter_raw = args[2] if len(args) == 3 else None
 
     if not is_valid_topic(topic):
         print(
@@ -384,12 +388,6 @@ def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.sock
             "value": value,
         }
 
-    subscription = {
-        "topic": topic,
-        "filter_raw": filter_raw,
-        "filter_data": filter_data,
-    }
-
     for existing in parsed["subscriptions"]:
         same_topic = existing["topic"] == topic
         same_filter_absence = existing["filter_raw"] is None and filter_raw is None
@@ -405,7 +403,13 @@ def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.sock
             print("pubsubclient: identical subscription ignored", file=sys.stderr, flush=True)
             return
 
-    parsed["subscriptions"].append(subscription)
+    parsed["subscriptions"].append(
+        {
+            "topic": topic,
+            "filter_raw": filter_raw,
+            "filter_data": filter_data,
+        }
+    )
 
     send_json(
         client_socket,
@@ -452,6 +456,13 @@ def quote_if_needed(value: str) -> str:
         return f'"{value}"'
     return value
 
+def parse_command_args(line: str) -> list[str] | None:
+    """Parse a command line into arguments with double quote support."""
+    try:
+        return shlex.split(line, posix=True)
+    except ValueError:
+        return None
+
 def handle_listsubs_command(parsed: dict) -> None:
     """Handle /listsubs command."""
     if not parsed["subscriptions"]:
@@ -469,9 +480,9 @@ def handle_listsubs_command(parsed: dict) -> None:
 
 def handle_unsubscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
     """Handle /unsubscribe command."""
-    parts = line.split(maxsplit=1)
+    args = parse_command_args(line)
 
-    if len(parts) != 2 or parts[1] == "":
+    if args is None or len(args) != 2:
         print(
             "pubsubclient: unknown argument(s) - usage: /unsubscribe topic",
             file=sys.stderr,
@@ -479,7 +490,7 @@ def handle_unsubscribe_command(line: str, parsed: dict, client_socket: socket.so
         )
         return
 
-    topic = parts[1]
+    topic = args[1]
 
     if not is_valid_topic(topic):
         print(
