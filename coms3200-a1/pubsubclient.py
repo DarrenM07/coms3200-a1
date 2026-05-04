@@ -10,6 +10,7 @@ default topic command, and publish message handling for the pubsub client.
 
 import socket
 import sys
+import threading
 
 from common import (
     is_printable_message,
@@ -116,6 +117,7 @@ def connect_to_server(parsed: dict) -> socket.socket:
             (parsed["host"], int(parsed["port"])),
             timeout=1.0,
         )
+        client_socket.settimeout(None)
     except (OSError, ValueError):
         print(
             f'pubsubclient: unable to connect to "{endpoint_for_error}"',
@@ -278,6 +280,10 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     client_socket.close()
                     sys.exit(0)
 
+                if stripped.startswith("/subscribe"):
+                    handle_subscribe_command(stripped, client_socket)
+                    continue
+
                 if stripped.startswith("/topic"):
                     handle_topic_command(stripped, parsed)
                     continue
@@ -295,6 +301,66 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
         client_socket.close()
         sys.exit(0)
 
+def handle_subscribe_command(line: str, client_socket: socket.socket) -> None:
+    """Handle /subscribe command without filter for now."""
+    parts = line.split(maxsplit=1)
+
+    if len(parts) != 2 or parts[1] == "":
+        print(
+            "pubsubclient: unknown argument(s) - usage: /subscribe topic [filter]",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    topic = parts[1]
+
+    if not is_valid_topic(topic):
+        print(
+            f'pubsubclient: invalid topic string "{topic}"',
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    send_json(
+        client_socket,
+        {
+            "type": "subscribe",
+            "topic": topic,
+            "filter": None,
+        },
+    )
+
+def server_reader_loop(sock_file) -> None:
+    """Read and print messages delivered from the server."""
+    try:
+        while True:
+            message = recv_json(sock_file)
+
+            if message is None:
+                print(
+                    "pubsubclient: server disconnected - exiting",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                sys.exit(10)
+
+            if message.get("type") == "deliver_message":
+                print(
+                    f'{message["topic"]}: {message["message"]} '
+                    f'({message["from_server"]}:{message["from_client"]})',
+                    flush=True,
+                )
+
+    except (OSError, ValueError):
+        print(
+            "pubsubclient: server disconnected - exiting",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(10)
+
 
 def main() -> None:
     """Run the pubsub client."""
@@ -302,7 +368,7 @@ def main() -> None:
     validate_args(parsed)
 
     client_socket = connect_to_server(parsed)
-    perform_handshake(client_socket, parsed)
+    sock_file = perform_handshake(client_socket, parsed)
 
     if parsed["message"] is not None:
         send_json(
@@ -316,8 +382,14 @@ def main() -> None:
         client_socket.close()
         sys.exit(0)
 
-    interactive_loop(client_socket, parsed)
+    reader_thread = threading.Thread(
+        target=server_reader_loop,
+        args=(sock_file,),
+        daemon=True,
+    )
+    reader_thread.start()
 
+    interactive_loop(client_socket, parsed)
 
 if __name__ == "__main__":
     main()

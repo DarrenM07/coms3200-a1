@@ -18,6 +18,7 @@ from protocol import make_socket_file, recv_json, send_json
 
 USAGE = "Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid"
 clients = {}
+subscriptions = {}
 clients_lock = threading.Lock()
 
 def usage_error() -> None:
@@ -159,6 +160,7 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 return
 
             clients[client_id] = client_socket
+            subscriptions.setdefault(client_id, [])
 
         send_json(
             client_socket,
@@ -172,11 +174,46 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         while True:
             next_message = recv_json(sock_file)
+
             if next_message is None:
                 break
 
+            if next_message.get("type") == "subscribe":
+                topic = next_message.get("topic")
+
+                with clients_lock:
+                    client_subs = subscriptions.setdefault(client_id, [])
+                    if topic not in client_subs:
+                        client_subs.append(topic)
+
+                continue
+
             if next_message.get("type") == "publish":
-                # Publishing will be forwarded to matching subscribers in the next phase.
+                topic = next_message.get("topic")
+                publish_message = next_message.get("message")
+
+                with clients_lock:
+                    target_sockets = [
+                        sock
+                        for subscriber_id, sock in clients.items()
+                        if topic in subscriptions.get(subscriber_id, [])
+                    ]
+
+                for target_socket in target_sockets:
+                    try:
+                        send_json(
+                            target_socket,
+                            {
+                                "type": "deliver_message",
+                                "topic": topic,
+                                "message": publish_message,
+                                "from_client": client_id,
+                                "from_server": server_id,
+                            },
+                        )
+                    except OSError:
+                        pass
+
                 continue
 
     except (OSError, ValueError):
@@ -187,6 +224,7 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
             with clients_lock:
                 if clients.get(client_id) is client_socket:
                     del clients[client_id]
+                    subscriptions.pop(client_id, None)
                     print(f'pubsubserver: Client "{client_id}" has disconnected', flush=True)
 
         client_socket.close()
