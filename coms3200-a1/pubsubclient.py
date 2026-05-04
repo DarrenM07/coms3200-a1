@@ -290,6 +290,14 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     handle_unsubscribe_command(stripped, parsed, client_socket)
                     continue
 
+                if stripped == "/listclients":
+                    handle_listclients_command(client_socket)
+                    continue
+
+                if stripped == "/listpeers":
+                    handle_listpeers_command(client_socket)
+                    continue
+
                 if stripped.startswith("/subscribe"):
                     handle_subscribe_command(stripped, parsed, client_socket)
                     continue
@@ -441,6 +449,24 @@ def server_reader_loop(sock_file) -> None:
                     f'({message["from_server"]}:{message["from_client"]})',
                     flush=True,
                 )
+            
+            elif message.get("type") == "listclients_response":
+                clients = message.get("clients", [])
+
+                if not clients:
+                    print("No clients connected", flush=True)
+                else:
+                    for client in sorted(clients):
+                        print(client, flush=True)
+
+            elif message.get("type") == "listpeers_response":
+                peers = message.get("peers", [])
+
+                if not peers:
+                    print("No peer servers connected", flush=True)
+                else:
+                    for peer in sorted(peers):
+                        print(peer, flush=True)
 
     except (OSError, ValueError):
         print(
@@ -529,6 +555,12 @@ def handle_unsubscribe_command(line: str, parsed: dict, client_socket: socket.so
     )
 
     print(f'pubsubclient: unsubscribed from messages about "{topic}"', flush=True)
+
+def handle_listclients_command(client_socket: socket.socket) -> None:
+    send_json(client_socket, {"type": "listclients"})
+
+def handle_listpeers_command(client_socket: socket.socket) -> None:
+    send_json(client_socket, {"type": "listpeers"})
 
 def main() -> None:
     """Run the pubsub client."""

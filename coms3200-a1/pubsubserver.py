@@ -207,6 +207,29 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
                 continue
 
+            if next_message.get("type") == "listclients":
+                with clients_lock:
+                    client_ids = list(clients.keys())
+
+                send_json(
+                    client_socket,
+                    {
+                        "type": "listclients_response",
+                        "clients": client_ids,
+                    },
+                )
+                continue
+
+            if next_message.get("type") == "listpeers":
+                send_json(
+                    client_socket,
+                    {
+                        "type": "listpeers_response",
+                        "peers": [],
+                    },
+                )
+                continue
+
             if next_message.get("type") == "publish":
                 topic = next_message.get("topic")
                 publish_message = next_message.get("message")
