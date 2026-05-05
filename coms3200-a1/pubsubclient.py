@@ -329,14 +329,6 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     handle_listlimits_command(parsed)
                     continue
 
-                if stripped == "/listclients":
-                    handle_listclients_command(client_socket)
-                    continue
-
-                if stripped == "/listpeers":
-                    handle_listpeers_command(client_socket)
-                    continue
-
                 if stripped.startswith("/subscribe"):
                     handle_subscribe_command(stripped, parsed, client_socket)
                     continue
@@ -448,7 +440,7 @@ def server_reader_loop(sock_file, parsed: dict) -> None:
                     file=sys.stderr,
                     flush=True,
                 )
-                sys.exit(10)
+                os._exit(10)
 
             if message.get("type") == "deliver_message":
                 print(
@@ -460,24 +452,6 @@ def server_reader_loop(sock_file, parsed: dict) -> None:
             elif message.get("type") == "server_shutdown":
                 print("pubsubclient: exiting due to server shutdown", flush=True)
                 os._exit(0)
-
-            elif message.get("type") == "listclients_response":
-                clients = message.get("clients", [])
-
-                if not clients:
-                    print("No clients connected", flush=True)
-                else:
-                    for client in sorted(clients):
-                        print(client, flush=True)
-
-            elif message.get("type") == "listpeers_response":
-                peers = message.get("peers", [])
-
-                if not peers:
-                    print("No peer servers connected", flush=True)
-                else:
-                    for peer in sorted(peers):
-                        print(peer, flush=True)
 
             elif message.get("type") == "rate_limit_notice":
                 topic = message["topic"]
@@ -539,7 +513,7 @@ def server_reader_loop(sock_file, parsed: dict) -> None:
             file=sys.stderr,
             flush=True,
         )
-        sys.exit(10)
+        os._exit(10)
 
 def quote_if_needed(value: str) -> str:
     """Quote a value if it contains whitespace."""
