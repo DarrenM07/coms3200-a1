@@ -318,7 +318,7 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         client_socket.close()
 
-def server_stdin_loop() -> None:
+def server_stdin_loop(server_id: str) -> None:
     """Handle server commands from stdin."""
     while True:
         line = sys.stdin.readline()
@@ -330,6 +330,25 @@ def server_stdin_loop() -> None:
         line = line.strip()
 
         if line == "":
+            continue
+
+        if line == "/listclients":
+            with clients_lock:
+                client_names = [
+                    f"{server_id}:{client_id}"
+                    for client_id in clients.keys()
+                ]
+
+            if not client_names:
+                print("pubsubserver: No clients connected", flush=True)
+            else:
+                for name in sorted(client_names):
+                    print(name, flush=True)
+
+            continue
+
+        if line == "/listpeers":
+            print("pubsubserver: No peer servers connected", flush=True)
             continue
 
         if line.startswith("/limit"):
@@ -415,7 +434,11 @@ def main() -> None:
     actual_port = server_socket.getsockname()[1]
 
     print(f"pubsubserver: listening on port {actual_port}", file=sys.stderr, flush=True)
-    stdin_thread = threading.Thread(target=server_stdin_loop, daemon=True)
+    stdin_thread = threading.Thread(
+        target=server_stdin_loop,
+        args=(parsed["server_id"],),
+        daemon=True,
+    )
     stdin_thread.start()
 
     try:
