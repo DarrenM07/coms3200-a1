@@ -8,6 +8,7 @@ command-line parsing, validation, TCP connection, handshake, interactive mode,
 default topic command, and publish message handling for the pubsub client.
 """
 
+import os
 import socket
 import sys
 import threading
@@ -323,42 +324,6 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
         client_socket.close()
         sys.exit(0)
 
-def parse_subscribe_line(line: str) -> tuple[str, str | None]:
-    """Parse /subscribe topic [filter] with simple quote support."""
-    rest = line[len("/subscribe"):].strip()
-
-    if rest == "":
-        raise ValueError("usage")
-
-    if rest.startswith('"'):
-        closing = rest.find('"', 1)
-        if closing == -1:
-            raise ValueError("usage")
-        topic = rest[1:closing]
-        remaining = rest[closing + 1:].strip()
-    else:
-        parts = rest.split(maxsplit=1)
-        topic = parts[0]
-        remaining = parts[1].strip() if len(parts) == 2 else ""
-
-    if topic == "":
-        raise ValueError("usage")
-
-    if remaining == "":
-        return topic, None
-
-    if remaining.startswith('"'):
-        if not remaining.endswith('"') or len(remaining) < 2:
-            raise ValueError("usage")
-        filter_raw = remaining[1:-1]
-    else:
-        filter_raw = remaining
-
-    if filter_raw == "":
-        raise ValueError("usage")
-
-    return topic, filter_raw
-
 def handle_subscribe_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
     """Handle /subscribe command with optional filter."""
     args = parse_command_args(line)
@@ -454,6 +419,10 @@ def server_reader_loop(sock_file, parsed: dict) -> None:
                     flush=True,
                 )
             
+            elif message.get("type") == "server_shutdown":
+                print("pubsubclient: exiting due to server shutdown", flush=True)
+                os._exit(0)
+
             elif message.get("type") == "listclients_response":
                 clients = message.get("clients", [])
 

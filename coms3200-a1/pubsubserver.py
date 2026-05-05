@@ -7,6 +7,7 @@
 command-line parsing, validation, and TCP listening structure for the pubsub server.
 """
 
+import os
 import socket
 import sys
 import time
@@ -318,19 +319,39 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
 
         client_socket.close()
 
+def shutdown_server() -> None:
+    """Notify all connected clients and terminate the server."""
+    with clients_lock:
+        client_sockets = list(clients.values())
+
+    for client_socket in client_sockets:
+        try:
+            send_json(client_socket, {"type": "server_shutdown"})
+        except OSError:
+            pass
+
+        try:
+            client_socket.close()
+        except OSError:
+            pass
+
+    os._exit(0)
+
 def server_stdin_loop(server_id: str) -> None:
     """Handle server commands from stdin."""
     while True:
         line = sys.stdin.readline()
 
         if line == "":
-            # EOF behaves like /quit later. For now, just exit.
-            sys.exit(0)
+            shutdown_server()
 
         line = line.strip()
 
         if line == "":
             continue
+
+        if line == "/quit":
+            shutdown_server()
 
         if line == "/listclients":
             with clients_lock:
