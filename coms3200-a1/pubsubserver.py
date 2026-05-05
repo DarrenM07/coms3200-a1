@@ -446,6 +446,20 @@ def shutdown_server() -> None:
         except OSError:
             pass
 
+    with peers_lock:
+        peer_sockets = list(peers.values())
+
+    for peer_socket in peer_sockets:
+        try:
+            send_json(
+                peer_socket,
+                {
+                    "type": "peer_shutdown",
+                    "serverid": get_own_server_id(),
+                },
+            )
+        except OSError:
+            pass
     os._exit(0)
 
 def get_own_server_id() -> str:
@@ -553,7 +567,7 @@ def server_stdin_loop(server_id: str) -> None:
                 parse_endpoint(endpoint)
             except ValueError:
                 print(
-                    f'pubsubserver: Peer server not found at "{endpoint}"',
+                    "pubsubserver: unknown argument(s) - usage: /peer [server]:port",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -628,6 +642,13 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
         while True:
             message = recv_json(sock_file)
             if message is None:
+                break
+
+            if message.get("type") == "peer_shutdown":
+                print(
+                    f'pubsubserver: Peer server "{message.get("serverid")}" shutting down',
+                    flush=True,
+                )
                 break
 
             if message.get("type") == "federated_publish":
