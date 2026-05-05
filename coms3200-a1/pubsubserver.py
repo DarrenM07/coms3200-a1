@@ -2,9 +2,13 @@
 @author Darren
 @ai Inspiration
 @ai Wrote Code
+@ai Debugging
+@ai Testing
 @aitool ChatGPT
-@aidetails ChatGPT was used to help design and implement the initial
-command-line parsing, validation, and TCP listening structure for the pubsub server.
+@aidetails ChatGPT was used to help design, implement, test and debug
+command-line parsing, validation, TCP listening, client handling, subscriptions,
+filtered publication, rate limiting, file sending, shutdown handling and server
+stdin command behaviour for the pubsub server.
 """
 
 import os
@@ -13,25 +17,29 @@ import sys
 import time
 import threading
 
-from common import filter_matches_message, is_valid_id, parse_endpoint
+from common import filter_matches_message, is_valid_id, is_valid_topic, parse_endpoint
 from protocol import make_socket_file, recv_json, send_json
 
 
 USAGE = "Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid"
+
 clients = {}
 subscriptions = {}
 rate_limits = {}
 last_publish_times = {}
 clients_lock = threading.Lock()
+peers = {}
+peers_lock = threading.Lock()
+pending_client_list_requests = {}
+pending_client_list_lock = threading.Lock()
+own_server_id = None
 
 def usage_error() -> None:
-    """Print the server usage error and exit."""
     print(USAGE, file=sys.stderr, flush=True)
     sys.exit(1)
 
 
 def parse_args(argv: list[str]) -> dict:
-    """Parse pubsubserver command-line arguments."""
     args = argv[1:]
     peer_args = []
     listen_port = None
@@ -44,74 +52,72 @@ def parse_args(argv: list[str]) -> dict:
         if arg == "--server":
             if index + 1 >= len(args) or args[index + 1] == "":
                 usage_error()
-
             peer_endpoint = args[index + 1]
-
             try:
                 parse_endpoint(peer_endpoint)
             except ValueError:
                 usage_error()
-
             peer_args.append(peer_endpoint)
             index += 2
 
         elif arg == "--listenon":
             if seen_listenon:
                 usage_error()
-
             if index + 1 >= len(args) or args[index + 1] == "":
                 usage_error()
-
             listen_port = args[index + 1]
             seen_listenon = True
             index += 2
 
         elif arg.startswith("-"):
             usage_error()
-
         else:
             break
 
     remaining = args[index:]
-
     if len(remaining) != 1:
         usage_error()
 
     server_id = remaining[0]
-
     if server_id == "":
         usage_error()
 
-    return {
-        "peer_args": peer_args,
-        "listen_port": listen_port,
-        "server_id": server_id,
-    }
+    return {"peer_args": peer_args, "listen_port": listen_port, "server_id": server_id}
 
 
 def validate_args(parsed: dict) -> None:
-    """Validate parsed command-line values after usage checking."""
     server_id = parsed["server_id"]
-
     if not is_valid_id(server_id):
         print(f'pubsubserver: bad server ID "{server_id}"', file=sys.stderr, flush=True)
         sys.exit(2)
 
 
-def create_listening_socket(listen_port: str | None) -> socket.socket:
-    """
-    Create and return a TCP listening socket.
-
-    If listen_port is None, bind to port 0 so the OS chooses a free port.
-    """
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def resolve_listen_port(listen_port: str | None) -> int:
+    if listen_port is None or listen_port == "0":
+        return 0
 
     try:
-        port_to_bind = 0 if listen_port is None else int(listen_port)
+        port = int(listen_port)
     except ValueError:
+        try:
+            return socket.getservbyname(listen_port, "tcp")
+        except OSError as exc:
+            raise ValueError from exc
+
+    if port < 1024:
+        raise PermissionError
+
+    return port
+
+
+def create_listening_socket(listen_port: str | None) -> socket.socket:
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        port_to_bind = resolve_listen_port(listen_port)
+    except (ValueError, PermissionError):
         server_socket.close()
-        print(f'pubsubserver: can’t listen on port "{listen_port}"', file=sys.stderr, flush=True)
+        print(f'pubsubserver: can\'t listen on port "{listen_port}"', file=sys.stderr, flush=True)
         sys.exit(3)
 
     try:
@@ -119,23 +125,123 @@ def create_listening_socket(listen_port: str | None) -> socket.socket:
         server_socket.listen()
     except OSError:
         server_socket.close()
-        if listen_port is None:
-            print('pubsubserver: can’t listen on port "0"', file=sys.stderr, flush=True)
-        else:
-            print(f'pubsubserver: can’t listen on port "{listen_port}"', file=sys.stderr, flush=True)
+        shown_port = "0" if listen_port is None else listen_port
+        print(f'pubsubserver: can\'t listen on port "{shown_port}"', file=sys.stderr, flush=True)
         sys.exit(3)
 
     return server_socket
 
+
+def matching_client_sockets(topic: str, message: str | None = None, file_mode: bool = False) -> list[socket.socket]:
+    targets = []
+    for subscriber_id, sock in clients.items():
+        for subscription in subscriptions.get(subscriber_id, []):
+            if subscription["topic"] != topic:
+                continue
+            filter_data = subscription["filter"]
+            if file_mode:
+                if filter_data is None:
+                    targets.append(sock)
+                    break
+                continue
+            if filter_data is None:
+                targets.append(sock)
+                break
+            if message is not None and filter_matches_message(message, filter_data["operator"], filter_data["value"]):
+                targets.append(sock)
+                break
+    return targets
+
+
+def check_rate_limit(client_id: str, topic: str) -> bool:
+    limit_key = (client_id, topic)
+    now = time.time()
+    with clients_lock:
+        limit_seconds = rate_limits.get(limit_key, 0)
+        last_time = last_publish_times.get(limit_key)
+        if limit_seconds > 0 and last_time is not None and now - last_time < limit_seconds:
+            return False
+        if limit_seconds > 0:
+            last_publish_times[limit_key] = now
+    return True
+
+def forward_to_peers(message: dict, except_peer_id: str | None = None) -> None:
+    """Forward a message to all directly connected peers except one."""
+    with peers_lock:
+        peer_items = list(peers.items())
+
+    for peer_id, peer_socket in peer_items:
+        if peer_id == except_peer_id:
+            continue
+
+        try:
+            send_json(peer_socket, message)
+        except OSError:
+            pass
+
+def deliver_file_to_local_clients(
+    topic: str,
+    filename: str,
+    file_data: str,
+    file_size: int,
+    from_server: str,
+    from_client: str,
+) -> None:
+    """Deliver a file to local clients subscribed to the topic without filters."""
+    with clients_lock:
+        targets = matching_client_sockets(topic, None, file_mode=True)
+
+    for target_socket in targets:
+        try:
+            send_json(
+                target_socket,
+                {
+                    "type": "deliver_file",
+                    "topic": topic,
+                    "filename": filename,
+                    "data": file_data,
+                    "size": file_size,
+                    "from_client": from_client,
+                    "from_server": from_server,
+                },
+            )
+        except OSError:
+            pass
+
+def deliver_publish_to_local_clients(
+    topic: str,
+    publish_message: str,
+    from_server: str,
+    from_client: str,
+) -> None:
+    """Deliver a published text message to local matching clients."""
+    with clients_lock:
+        targets = matching_client_sockets(topic, publish_message, file_mode=False)
+
+    for target_socket in targets:
+        try:
+            send_json(
+                target_socket,
+                {
+                    "type": "deliver_message",
+                    "topic": topic,
+                    "message": publish_message,
+                    "from_client": from_client,
+                    "from_server": from_server,
+                },
+            )
+        except OSError:
+            pass
+
 def handle_connection(client_socket: socket.socket, server_id: str) -> None:
-    """Handle one incoming client connection."""
     client_id = None
+    client_socket.settimeout(1.0)
 
     try:
         sock_file = make_socket_file(client_socket)
         message = recv_json(sock_file)
 
-        if message is None or message.get("type") != "hello_client":
+        if message is None:
             print(
                 "pubsubserver: Connection with unknown client aborted",
                 file=sys.stderr,
@@ -144,6 +250,48 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
             client_socket.close()
             return
 
+        if message.get("type") == "hello_server":
+            peer_id = message.get("serverid")
+
+            if peer_id == server_id:
+                send_json(
+                    client_socket,
+                    {
+                        "type": "hello_server_ack",
+                        "serverid": server_id,
+                    },
+                )
+                client_socket.close()
+                return
+
+            send_json(
+                client_socket,
+                {
+                    "type": "hello_server_ack",
+                    "serverid": server_id,
+                },
+            )
+
+            client_socket.settimeout(None)
+
+            with peers_lock:
+                peers[peer_id] = client_socket
+
+            print(f'pubsubserver: Connection received from peer "{peer_id}"', flush=True)
+
+            handle_peer_connection(client_socket, peer_id)
+            return
+
+        if message.get("type") != "hello_client":
+            print(
+                "pubsubserver: Connection with unknown client aborted",
+                file=sys.stderr,
+                flush=True,
+            )
+            client_socket.close()
+            return
+
+        client_socket.settimeout(None)
         client_id = message.get("clientid")
 
         with clients_lock:
@@ -152,27 +300,14 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                     f'pubsubserver: Client ID "{client_id}" would be duplicated - aborting connection',
                     flush=True,
                 )
-                send_json(
-                    client_socket,
-                    {
-                        "type": "error",
-                        "code": "duplicate_client_id",
-                    },
-                )
+                send_json(client_socket, {"type": "error", "code": "duplicate_client_id"})
                 client_socket.close()
                 return
 
             clients[client_id] = client_socket
             subscriptions.setdefault(client_id, [])
 
-        send_json(
-            client_socket,
-            {
-                "type": "hello_ack",
-                "serverid": server_id,
-            },
-        )
-
+        send_json(client_socket, {"type": "hello_ack", "serverid": server_id})
         print(f'pubsubserver: Client "{client_id}" has connected', flush=True)
 
         while True:
@@ -182,12 +317,9 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 break
 
             if next_message.get("type") == "subscribe":
-                topic = next_message.get("topic")
-                filter_data = next_message.get("filter")
-
                 subscription = {
-                    "topic": topic,
-                    "filter": filter_data,
+                    "topic": next_message.get("topic"),
+                    "filter": next_message.get("filter"),
                 }
 
                 with clients_lock:
@@ -203,69 +335,8 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 with clients_lock:
                     client_subs = subscriptions.setdefault(client_id, [])
                     subscriptions[client_id] = [
-                        existing_subscription
-                        for existing_subscription in client_subs
-                        if existing_subscription["topic"] != topic
+                        sub for sub in client_subs if sub["topic"] != topic
                     ]
-
-                continue
-
-            if next_message.get("type") == "send_file":
-                topic = next_message.get("topic")
-                filename = next_message.get("filename")
-                file_data = next_message.get("data")
-                file_size = next_message.get("size")
-
-                limit_key = (client_id, topic)
-                now = time.time()
-
-                with clients_lock:
-                    limit_seconds = rate_limits.get(limit_key, 0)
-                    last_time = last_publish_times.get(limit_key)
-
-                    if (
-                        limit_seconds > 0
-                        and last_time is not None
-                        and now - last_time < limit_seconds
-                    ):
-                        rate_limited = True
-                    else:
-                        rate_limited = False
-                        if limit_seconds > 0:
-                            last_publish_times[limit_key] = now
-
-                if rate_limited:
-                    try:
-                        send_json(client_socket, {"type": "rate_limit_failed"})
-                    except OSError:
-                        pass
-                    continue
-
-                with clients_lock:
-                    target_sockets = []
-
-                    for subscriber_id, sock in clients.items():
-                        for subscription in subscriptions.get(subscriber_id, []):
-                            if subscription["topic"] == topic and subscription["filter"] is None:
-                                target_sockets.append(sock)
-                                break
-
-                for target_socket in target_sockets:
-                    try:
-                        send_json(
-                            target_socket,
-                            {
-                                "type": "deliver_file",
-                                "topic": topic,
-                                "filename": filename,
-                                "data": file_data,
-                                "size": file_size,
-                                "from_client": client_id,
-                                "from_server": server_id,
-                            },
-                        )
-                    except OSError:
-                        pass
 
                 continue
 
@@ -273,66 +344,67 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 topic = next_message.get("topic")
                 publish_message = next_message.get("message")
 
-                limit_key = (client_id, topic)
-                now = time.time()
-
-                with clients_lock:
-                    limit_seconds = rate_limits.get(limit_key, 0)
-                    last_time = last_publish_times.get(limit_key)
-
-                    # CHECK RATE LIMIT
-                    if (
-                        limit_seconds > 0
-                        and last_time is not None
-                        and now - last_time < limit_seconds
-                    ):
-                        try:
-                            send_json(client_socket, {"type": "rate_limit_failed"})
-                        except OSError:
-                            pass
-                        continue
-
-                    # IMPORTANT: ALWAYS update timestamp if limit exists
-                    if limit_seconds > 0:
-                        last_publish_times[limit_key] = now
-
-                # DELIVER MESSAGE
-                with clients_lock:
-                    target_sockets = []
-
-                    for subscriber_id, sock in clients.items():
-                        for subscription in subscriptions.get(subscriber_id, []):
-                            if subscription["topic"] != topic:
-                                continue
-
-                            filter_data = subscription["filter"]
-
-                            if filter_data is None:
-                                target_sockets.append(sock)
-                                break
-
-                            if filter_matches_message(
-                                publish_message,
-                                filter_data["operator"],
-                                filter_data["value"],
-                            ):
-                                target_sockets.append(sock)
-                                break
-
-                for target_socket in target_sockets:
+                if not check_rate_limit(client_id, topic):
                     try:
-                        send_json(
-                            target_socket,
-                            {
-                                "type": "deliver_message",
-                                "topic": topic,
-                                "message": publish_message,
-                                "from_client": client_id,
-                                "from_server": server_id,
-                            },
-                        )
+                        send_json(client_socket, {"type": "rate_limit_failed"})
                     except OSError:
                         pass
+                    continue
+
+                deliver_publish_to_local_clients(
+                    topic,
+                    publish_message,
+                    server_id,
+                    client_id,
+                )
+
+                forward_to_peers(
+                    {
+                        "type": "federated_publish",
+                        "topic": topic,
+                        "message": publish_message,
+                        "from_client": client_id,
+                        "from_server": server_id,
+                        "origin_id": f"{server_id}:{client_id}:{time.time_ns()}",
+                    }
+                )
+
+                continue
+
+            if next_message.get("type") == "send_file":
+                topic = next_message.get("topic")
+
+                if not check_rate_limit(client_id, topic):
+                    try:
+                        send_json(client_socket, {"type": "rate_limit_failed"})
+                    except OSError:
+                        pass
+                    continue
+
+                with clients_lock:
+                    targets = matching_client_sockets(topic, None, file_mode=True)
+
+                deliver_file_to_local_clients(
+                    topic,
+                    next_message.get("filename"),
+                    next_message.get("data"),
+                    next_message.get("size"),
+                    server_id,
+                    client_id,
+                )
+
+                forward_to_peers(
+                    {
+                        "type": "federated_file",
+                        "topic": topic,
+                        "filename": next_message.get("filename"),
+                        "data": next_message.get("data"),
+                        "size": next_message.get("size"),
+                        "from_client": client_id,
+                        "from_server": server_id,
+                        "origin_id": f"{server_id}:{client_id}:file:{time.time_ns()}",
+                    }
+                )
 
                 continue
 
@@ -347,10 +419,12 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                     subscriptions.pop(client_id, None)
                     print(f'pubsubserver: Client "{client_id}" has disconnected', flush=True)
 
-        client_socket.close()
+        try:
+            client_socket.close()
+        except OSError:
+            pass
 
 def shutdown_server() -> None:
-    """Notify all connected clients and terminate the server."""
     with clients_lock:
         client_sockets = list(clients.values())
 
@@ -359,7 +433,6 @@ def shutdown_server() -> None:
             send_json(client_socket, {"type": "server_shutdown"})
         except OSError:
             pass
-
         try:
             client_socket.close()
         except OSError:
@@ -367,93 +440,124 @@ def shutdown_server() -> None:
 
     os._exit(0)
 
+def get_own_server_id() -> str:
+    return own_server_id
+
+def local_client_names(server_id: str) -> list[str]:
+    """Return local client names as serverid:clientid."""
+    with clients_lock:
+        return [f"{server_id}:{client_id}" for client_id in clients.keys()]
+
+def request_clients_from_peers(request_id: str) -> None:
+    """Ask all direct peers for their local client names."""
+    forward_to_peers(
+        {
+            "type": "list_clients_request",
+            "request_id": request_id,
+        }
+    )
+
 def server_stdin_loop(server_id: str) -> None:
-    """Handle server commands from stdin."""
     while True:
         line = sys.stdin.readline()
-
         if line == "":
             shutdown_server()
 
         line = line.strip()
-
         if line == "":
             continue
 
-        if line == "/quit":
+        args = line.split()
+        command = args[0]
+
+        if command == "/quit":
+            if len(args) != 1:
+                print("pubsubserver: unknown argument(s) - usage: /quit", file=sys.stderr, flush=True)
+                continue
             shutdown_server()
 
-        if line == "/listclients":
-            with clients_lock:
-                client_names = [
-                    f"{server_id}:{client_id}"
-                    for client_id in clients.keys()
-                ]
-
-            if not client_names:
-                print("pubsubserver: No clients connected", flush=True)
-            else:
-                for name in sorted(client_names):
-                    print(name, flush=True)
-
-            continue
-
-        if line == "/listpeers":
-            print("pubsubserver: No peer servers connected", flush=True)
-            continue
-
-        if line.startswith("/limit"):
-            parts = line.split(maxsplit=3)
-
-            if len(parts) != 4:
+        if command == "/listclients":
+            if len(args) > 2 or (len(args) == 2 and args[1] != "--all"):
                 print(
-                    "pubsubserver: unknown argument(s) - usage: /limit clientid topic N",
+                    "pubsubserver: unknown argument(s) - usage: /listclients [--all]",
                     file=sys.stderr,
                     flush=True,
                 )
                 continue
 
-            client_id = parts[1]
-            topic = parts[2]
-            limit_raw = parts[3]
+            client_names = local_client_names(server_id)
+
+            if len(args) == 2 and args[1] == "--all":
+                request_id = f"{server_id}:{time.time_ns()}"
+
+                with pending_client_list_lock:
+                    pending_client_list_requests[request_id] = []
+
+                request_clients_from_peers(request_id)
+
+                time.sleep(0.2)
+
+                with pending_client_list_lock:
+                    peer_names = pending_client_list_requests.pop(request_id, [])
+
+                client_names.extend(peer_names)
+
+            if not client_names:
+                print("pubsubserver: No clients connected", flush=True)
+            else:
+                for name in sorted(set(client_names)):
+                    print(name, flush=True)
+
+            continue
+
+        if args[0] == "/listpeers":
+            if len(args) > 2 or (len(args) == 2 and args[1] != "--all"):
+                print(
+                    "pubsubserver: unknown argument(s) - usage: /listpeers [--all]",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            with peers_lock:
+                peer_ids = sorted(peers.keys())
+
+            if not peer_ids:
+                print("pubsubserver: No peer servers connected", flush=True)
+            else:
+                for peer_id in peer_ids:
+                    print(peer_id, flush=True)
+
+            continue
+
+        if command == "/limit":
+            if len(args) != 4:
+                print("pubsubserver: unknown argument(s) - usage: /limit clientid topic N", file=sys.stderr, flush=True)
+                continue
+
+            client_id = args[1]
+            topic = args[2]
+            limit_raw = args[3]
 
             with clients_lock:
                 client_socket = clients.get(client_id)
 
             if client_socket is None or not is_valid_id(client_id):
-                print(
-                    f'pubsubserver: Client "{client_id}" is unknown',
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print(f'pubsubserver: Client "{client_id}" is unknown', file=sys.stderr, flush=True)
                 continue
 
-            from common import is_valid_topic
-
             if not is_valid_topic(topic):
-                print(
-                    f'pubsubserver: Topic "{topic}" is not valid',
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print(f'pubsubserver: Topic "{topic}" is not valid', file=sys.stderr, flush=True)
                 continue
 
             try:
                 limit_seconds = int(limit_raw)
             except ValueError:
-                print(
-                    "pubsubserver: Rate limit must be 0 to 3600 seconds inclusive",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print("pubsubserver: Rate limit must be 0 to 3600 seconds inclusive", file=sys.stderr, flush=True)
                 continue
 
             if limit_seconds < 0 or limit_seconds > 3600:
-                print(
-                    "pubsubserver: Rate limit must be 0 to 3600 seconds inclusive",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print("pubsubserver: Rate limit must be 0 to 3600 seconds inclusive", file=sys.stderr, flush=True)
                 continue
 
             with clients_lock:
@@ -461,45 +565,170 @@ def server_stdin_loop(server_id: str) -> None:
                 last_publish_times.pop((client_id, topic), None)
 
             try:
-                send_json(
-                    client_socket,
-                    {
-                        "type": "rate_limit_notice",
-                        "topic": topic,
-                        "limit": limit_seconds,
-                    },
-                )
+                send_json(client_socket, {"type": "rate_limit_notice", "topic": topic, "limit": limit_seconds})
             except OSError:
                 pass
-
             continue
 
         print("pubsubserver: unknown command", file=sys.stderr, flush=True)
 
+def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
+    """Handle an established peer server connection."""
+    try:
+        sock_file = make_socket_file(peer_socket)
+
+        while True:
+            message = recv_json(sock_file)
+            if message is None:
+                break
+
+            if message.get("type") == "federated_publish":
+                topic = message.get("topic")
+                publish_message = message.get("message")
+                from_client = message.get("from_client")
+                from_server = message.get("from_server")
+                origin_id = message.get("origin_id")
+
+                deliver_publish_to_local_clients(
+                    topic,
+                    publish_message,
+                    from_server,
+                    from_client,
+                )
+
+                forward_to_peers(message, except_peer_id=peer_id)
+                continue
+
+            if message.get("type") == "federated_file":
+                topic = message.get("topic")
+
+                deliver_file_to_local_clients(
+                    topic,
+                    message.get("filename"),
+                    message.get("data"),
+                    message.get("size"),
+                    message.get("from_server"),
+                    message.get("from_client"),
+                )
+
+                forward_to_peers(message, except_peer_id=peer_id)
+                continue
+
+            if message.get("type") == "list_clients_request":
+                send_json(
+                    peer_socket,
+                    {
+                        "type": "list_clients_response",
+                        "request_id": message.get("request_id"),
+                        "clients": local_client_names(get_own_server_id()),
+                    },
+                )
+                continue
+
+            if message.get("type") == "list_clients_response":
+                request_id = message.get("request_id")
+                clients_from_peer = message.get("clients", [])
+
+                with pending_client_list_lock:
+                    if request_id in pending_client_list_requests:
+                        pending_client_list_requests[request_id].extend(clients_from_peer)
+
+                continue
+
+    except (OSError, ValueError):
+        pass
+
+    finally:
+        with peers_lock:
+            if peers.get(peer_id) is peer_socket:
+                del peers[peer_id]
+
+        try:
+            peer_socket.close()
+        except OSError:
+            pass
+
+def connect_to_peer(endpoint: str, server_id: str) -> None:
+    """Connect to a peer server from --server or /peer."""
+    try:
+        host, port = parse_endpoint(endpoint)
+        peer_socket = socket.create_connection((host, int(port)), timeout=1.0)
+        peer_socket.settimeout(1.0)
+    except (OSError, ValueError):
+        print(f'pubsubserver: can\'t connect to peer "{endpoint}"', file=sys.stderr, flush=True)
+        return
+
+    try:
+        sock_file = make_socket_file(peer_socket)
+
+        send_json(
+            peer_socket,
+            {
+                "type": "hello_server",
+                "serverid": server_id,
+            },
+        )
+
+        response = recv_json(sock_file)
+
+        if response is None or response.get("type") != "hello_server_ack":
+            print(f'pubsubserver: Peer server not found at "{endpoint}"', file=sys.stderr, flush=True)
+            peer_socket.close()
+            return
+
+        peer_id = response.get("serverid")
+
+        if peer_id == server_id:
+            print("pubsubserver: Can't connect to self as peer", file=sys.stderr, flush=True)
+            peer_socket.close()
+            return
+
+        with peers_lock:
+            if peer_id in peers:
+                print(f'pubsubserver: Already connected to peer server at "{endpoint}"', file=sys.stderr, flush=True)
+                peer_socket.close()
+                return
+
+            peer_socket.settimeout(None)
+            peers[peer_id] = peer_socket
+
+        print(f'pubsubserver: Connected to peer "{peer_id}" at "{endpoint}"', flush=True)
+
+        thread = threading.Thread(
+            target=handle_peer_connection,
+            args=(peer_socket, peer_id),
+            daemon=True,
+        )
+        thread.start()
+
+    except (OSError, ValueError):
+        print(f'pubsubserver: Peer server not found at "{endpoint}"', file=sys.stderr, flush=True)
+        try:
+            peer_socket.close()
+        except OSError:
+            pass
+
 def main() -> None:
-    """Run the pubsub server."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
 
+    global own_server_id
+    own_server_id = parsed["server_id"]
+
     server_socket = create_listening_socket(parsed["listen_port"])
     actual_port = server_socket.getsockname()[1]
-
     print(f"pubsubserver: listening on port {actual_port}", file=sys.stderr, flush=True)
-    stdin_thread = threading.Thread(
-        target=server_stdin_loop,
-        args=(parsed["server_id"],),
-        daemon=True,
-    )
+
+    stdin_thread = threading.Thread(target=server_stdin_loop, args=(parsed["server_id"],), daemon=True)
     stdin_thread.start()
+
+    for peer_endpoint in parsed["peer_args"]:
+        connect_to_peer(peer_endpoint, parsed["server_id"])
 
     try:
         while True:
             client_socket, _ = server_socket.accept()
-            thread = threading.Thread(
-                target=handle_connection,
-                args=(client_socket, parsed["server_id"]),
-                daemon=True,
-            )
+            thread = threading.Thread(target=handle_connection, args=(client_socket, parsed["server_id"]), daemon=True)
             thread.start()
     except KeyboardInterrupt:
         server_socket.close()
