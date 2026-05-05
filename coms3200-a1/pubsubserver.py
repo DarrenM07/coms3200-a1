@@ -33,8 +33,10 @@ peers_lock = threading.Lock()
 pending_client_list_requests = {}
 pending_client_list_lock = threading.Lock()
 own_server_id = None
+own_listen_port = None
 seen_origins = set()
 seen_origins_lock = threading.Lock()
+
 
 def usage_error() -> None:
     print(USAGE, file=sys.stderr, flush=True)
@@ -727,6 +729,9 @@ def connect_to_peer(endpoint: str, server_id: str) -> None:
     """Connect to a peer server from --server or /peer."""
     try:
         host, port = parse_endpoint(endpoint)
+        if int(port) == own_listen_port:
+            print("pubsubserver: Can't connect to self as peer", file=sys.stderr, flush=True)
+            return
         peer_socket = socket.create_connection((host, int(port)), timeout=1.0)
         peer_socket.settimeout(1.0)
     except (OSError, ValueError):
@@ -754,7 +759,11 @@ def connect_to_peer(endpoint: str, server_id: str) -> None:
         peer_id = response.get("serverid")
 
         if peer_id == server_id:
-            print("pubsubserver: Can't connect to self as peer", file=sys.stderr, flush=True)
+            print(
+                f'pubsubserver: Unable to connect to server "{endpoint}" due to common server IDs',
+                file=sys.stderr,
+                flush=True,
+            )
             peer_socket.close()
             return
 
@@ -792,6 +801,8 @@ def main() -> None:
 
     server_socket = create_listening_socket(parsed["listen_port"])
     actual_port = server_socket.getsockname()[1]
+    global own_listen_port
+    own_listen_port = actual_port
     print(f"pubsubserver: listening on port {actual_port}", file=sys.stderr, flush=True)
 
     stdin_thread = threading.Thread(target=server_stdin_loop, args=(parsed["server_id"],), daemon=True)
