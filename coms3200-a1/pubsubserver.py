@@ -233,6 +233,65 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                 )
                 continue
 
+            if next_message.get("type") == "send_file":
+                topic = next_message.get("topic")
+                filename = next_message.get("filename")
+                file_data = next_message.get("data")
+                file_size = next_message.get("size")
+
+                limit_key = (client_id, topic)
+                now = time.time()
+
+                with clients_lock:
+                    limit_seconds = rate_limits.get(limit_key, 0)
+                    last_time = last_publish_times.get(limit_key)
+
+                    if (
+                        limit_seconds > 0
+                        and last_time is not None
+                        and now - last_time < limit_seconds
+                    ):
+                        rate_limited = True
+                    else:
+                        rate_limited = False
+                        if limit_seconds > 0:
+                            last_publish_times[limit_key] = now
+
+                if rate_limited:
+                    try:
+                        send_json(client_socket, {"type": "rate_limit_failed"})
+                    except OSError:
+                        pass
+                    continue
+
+                with clients_lock:
+                    target_sockets = []
+
+                    for subscriber_id, sock in clients.items():
+                        for subscription in subscriptions.get(subscriber_id, []):
+                            if subscription["topic"] == topic and subscription["filter"] is None:
+                                target_sockets.append(sock)
+                                break
+
+                for target_socket in target_sockets:
+                    try:
+                        send_json(
+                            target_socket,
+                            {
+                                "type": "deliver_file",
+                                "topic": topic,
+                                "filename": filename,
+                                "data": file_data,
+                                "size": file_size,
+                                "from_client": client_id,
+                                "from_server": server_id,
+                            },
+                        )
+                    except OSError:
+                        pass
+
+                continue
+
             if next_message.get("type") == "publish":
                 topic = next_message.get("topic")
                 publish_message = next_message.get("message")

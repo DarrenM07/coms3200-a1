@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import shlex
+import base64
 
 from common import (
     is_printable_message,
@@ -311,6 +312,10 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     handle_topic_command(stripped, parsed)
                     continue
 
+                if stripped.startswith("/sendfile"):
+                    handle_sendfile_command(stripped, parsed, client_socket)
+                    continue
+
                 if stripped.startswith("/publish"):
                     handle_publish_command(stripped, client_socket)
                     continue
@@ -474,6 +479,26 @@ def server_reader_loop(sock_file, parsed: dict) -> None:
                     file=sys.stderr,
                     flush=True,
                 )
+            
+            elif message.get("type") == "deliver_file":
+                parsed["received_file_count"] += 1
+
+                original_filename = message["filename"]
+                save_filename = f'{parsed["received_file_count"]}_{os.path.basename(original_filename)}'
+                file_bytes = base64.b64decode(message["data"].encode("ascii"))
+
+                try:
+                    with open(save_filename, "wb") as file:
+                        file.write(file_bytes)
+                except OSError:
+                    print(f'pubsubclient: cannot save file "{save_filename}"', file=sys.stderr, flush=True)
+                    continue
+
+                print(
+                    f'{message["topic"]}: received file "{save_filename}" '
+                    f'from {message["from_server"]}:{message["from_client"]} ({len(file_bytes)} bytes)',
+                    flush=True,
+                )
 
     except (OSError, ValueError):
         print(
@@ -579,12 +604,56 @@ def handle_listlimits_command(parsed: dict) -> None:
         topic = quote_if_needed(limit["topic"])
         print(f'/limit {limit["client_id"]} {topic} {limit["limit"]}', flush=True)
 
+def handle_sendfile_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
+    """Handle /sendfile filename [topic]."""
+    args = parse_command_args(line)
+
+    if args is None or len(args) not in (2, 3):
+        print(
+            "pubsubclient: unknown argument(s) - usage: /sendfile filename [topic]",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    filename = args[1]
+
+    try:
+        with open(filename, "rb") as file:
+            file_bytes = file.read()
+    except OSError:
+        print(f'pubsubclient: unable to open file "{filename}"', file=sys.stderr, flush=True)
+        return
+
+    if len(args) == 3:
+        topic = args[2]
+        if not is_valid_topic(topic):
+            print(f'pubsubclient: invalid topic string "{topic}"', file=sys.stderr, flush=True)
+            return
+    else:
+        topic = parsed["default_topic"]
+        if topic is None:
+            print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
+            return
+
+    send_json(
+        client_socket,
+        {
+            "type": "send_file",
+            "topic": topic,
+            "filename": os.path.basename(filename),
+            "data": base64.b64encode(file_bytes).decode("ascii"),
+            "size": len(file_bytes),
+        },
+    )
+
 def main() -> None:
     """Run the pubsub client."""
     parsed = parse_args(sys.argv)
     validate_args(parsed)
     parsed["subscriptions"] = []
     parsed["rate_limits"] = []
+    parsed["received_file_count"] = 0
 
     client_socket = connect_to_server(parsed)
     sock_file = perform_handshake(client_socket, parsed)
