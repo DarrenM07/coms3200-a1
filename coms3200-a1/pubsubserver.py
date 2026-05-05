@@ -33,6 +33,8 @@ peers_lock = threading.Lock()
 pending_client_list_requests = {}
 pending_client_list_lock = threading.Lock()
 own_server_id = None
+seen_origins = set()
+seen_origins_lock = threading.Lock()
 
 def usage_error() -> None:
     print(USAGE, file=sys.stderr, flush=True)
@@ -275,6 +277,12 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
             client_socket.settimeout(None)
 
             with peers_lock:
+                if peer_id in peers:
+                    try:
+                        peers[peer_id].close()
+                    except OSError:
+                        pass
+
                 peers[peer_id] = client_socket
 
             print(f'pubsubserver: Connection received from peer "{peer_id}"', flush=True)
@@ -510,7 +518,7 @@ def server_stdin_loop(server_id: str) -> None:
 
             continue
 
-        if args[0] == "/listpeers":
+        if command == "/listpeers":
             if len(args) > 2 or (len(args) == 2 and args[1] != "--all"):
                 print(
                     "pubsubserver: unknown argument(s) - usage: /listpeers [--all]",
@@ -528,6 +536,30 @@ def server_stdin_loop(server_id: str) -> None:
                 for peer_id in peer_ids:
                     print(peer_id, flush=True)
 
+            continue
+
+        if command == "/peer":
+            if len(args) != 2:
+                print(
+                    "pubsubserver: unknown argument(s) - usage: /peer [server]:port",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            endpoint = args[1]
+
+            try:
+                parse_endpoint(endpoint)
+            except ValueError:
+                print(
+                    f'pubsubserver: Peer server not found at "{endpoint}"',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            connect_to_peer(endpoint, server_id)
             continue
 
         if command == "/limit":
@@ -572,6 +604,22 @@ def server_stdin_loop(server_id: str) -> None:
 
         print("pubsubserver: unknown command", file=sys.stderr, flush=True)
 
+def should_process_origin(origin_id: str | None) -> bool:
+    """Return True if this federated message origin has not been processed before."""
+    if origin_id is None:
+        return True
+
+    with seen_origins_lock:
+        if origin_id in seen_origins:
+            return False
+
+        seen_origins.add(origin_id)
+
+        if len(seen_origins) > 10000:
+            seen_origins.clear()
+
+        return True
+
 def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
     """Handle an established peer server connection."""
     try:
@@ -589,6 +637,9 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                 from_server = message.get("from_server")
                 origin_id = message.get("origin_id")
 
+                if not should_process_origin(origin_id):
+                    continue
+
                 deliver_publish_to_local_clients(
                     topic,
                     publish_message,
@@ -601,6 +652,9 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
 
             if message.get("type") == "federated_file":
                 topic = message.get("topic")
+
+                if not should_process_origin(message.get("origin_id")):
+                    continue
 
                 deliver_file_to_local_clients(
                     topic,
