@@ -14,6 +14,7 @@ import sys
 import threading
 import shlex
 import base64
+import time
 
 from common import (
     is_printable_message,
@@ -194,8 +195,34 @@ def handle_topic_command(line: str, parsed: dict) -> None:
 
     parsed["default_topic"] = topic
 
+def check_client_rate_limit(parsed: dict, topic: str) -> bool:
+    """Return True if publication is allowed under client-side rate limits."""
+    limit_seconds = 0
 
-def handle_publish_command(line: str, client_socket: socket.socket) -> None:
+    for item in parsed["rate_limits"]:
+        if item["client_id"] == parsed["client_id"] and item["topic"] == topic:
+            limit_seconds = item["limit"]
+            break
+
+    if limit_seconds <= 0:
+        return True
+
+    now = time.time()
+    last_time = parsed["last_publish_times"].get(topic)
+
+    if last_time is not None and now - last_time < limit_seconds:
+        print(
+            "pubsubclient: message publication failed due to rate limit",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+    parsed["last_publish_times"][topic] = now
+    return True
+
+
+def handle_publish_command(line: str, parsed: dict, client_socket: socket.socket) -> None:
     """Handle /publish command."""
     args = parse_command_args(line)
 
@@ -226,6 +253,9 @@ def handle_publish_command(line: str, client_socket: socket.socket) -> None:
         )
         return
 
+    if not check_client_rate_limit(parsed, topic):
+        return
+
     send_json(
         client_socket,
         {
@@ -248,6 +278,9 @@ def handle_default_message(line: str, parsed: dict, client_socket: socket.socket
             file=sys.stderr,
             flush=True,
         )
+        return
+
+    if not check_client_rate_limit(parsed, parsed["default_topic"]):
         return
 
     send_json(
@@ -317,7 +350,7 @@ def interactive_loop(client_socket: socket.socket, parsed: dict) -> None:
                     continue
 
                 if stripped.startswith("/publish"):
-                    handle_publish_command(stripped, client_socket)
+                    handle_publish_command(stripped, parsed, client_socket)
                     continue
 
                 print("pubsubclient: unknown command", file=sys.stderr, flush=True)
@@ -636,6 +669,9 @@ def handle_sendfile_command(line: str, parsed: dict, client_socket: socket.socke
             print("pubsubclient: no default topic set", file=sys.stderr, flush=True)
             return
 
+    if not check_client_rate_limit(parsed, topic):
+        return
+
     send_json(
         client_socket,
         {
@@ -654,9 +690,14 @@ def main() -> None:
     parsed["subscriptions"] = []
     parsed["rate_limits"] = []
     parsed["received_file_count"] = 0
+    parsed["last_publish_times"] = {}
 
     client_socket = connect_to_server(parsed)
     sock_file = perform_handshake(client_socket, parsed)
+
+    if not check_client_rate_limit(parsed, parsed["default_topic"]):
+        client_socket.close()
+        sys.exit(0)
 
     if parsed["message"] is not None:
         send_json(

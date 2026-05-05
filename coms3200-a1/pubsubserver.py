@@ -303,29 +303,23 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                     limit_seconds = rate_limits.get(limit_key, 0)
                     last_time = last_publish_times.get(limit_key)
 
+                    # CHECK RATE LIMIT
                     if (
                         limit_seconds > 0
                         and last_time is not None
                         and now - last_time < limit_seconds
                     ):
-                        rate_limited = True
-                    else:
-                        rate_limited = False
-                        if limit_seconds > 0:
-                            last_publish_times[limit_key] = now
+                        try:
+                            send_json(client_socket, {"type": "rate_limit_failed"})
+                        except OSError:
+                            pass
+                        continue
 
-                if rate_limited:
-                    try:
-                        send_json(
-                            client_socket,
-                            {
-                                "type": "rate_limit_failed",
-                            },
-                        )
-                    except OSError:
-                        pass
-                    continue
+                    # IMPORTANT: ALWAYS update timestamp if limit exists
+                    if limit_seconds > 0:
+                        last_publish_times[limit_key] = now
 
+                # DELIVER MESSAGE
                 with clients_lock:
                     target_sockets = []
 
