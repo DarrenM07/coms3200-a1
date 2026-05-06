@@ -38,7 +38,10 @@ seen_origins = set()
 seen_origins_lock = threading.Lock()
 pending_peer_list_requests = {}
 pending_peer_list_lock = threading.Lock()
-
+client_request_routes = {}
+client_request_routes_lock = threading.Lock()
+peer_request_routes = {}
+peer_request_routes_lock = threading.Lock()
 
 def usage_error() -> None:
     print(USAGE, file=sys.stderr, flush=True)
@@ -562,6 +565,7 @@ def server_stdin_loop(server_id: str) -> None:
                 peer_ids.extend(extra_peers)
 
             peer_ids = sorted(set(peer_ids))
+            peer_ids = [peer_id for peer_id in peer_ids if peer_id != server_id]
 
             if not peer_ids:
                 print("pubsubserver: No peer servers connected", flush=True)
@@ -712,15 +716,45 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                 request_id = message.get("request_id")
                 clients_from_peer = message.get("clients", [])
 
+                handled_locally = False
+
                 with pending_client_list_lock:
                     if request_id in pending_client_list_requests:
                         pending_client_list_requests[request_id].extend(clients_from_peer)
+                        handled_locally = True
+
+                if not handled_locally:
+                    with client_request_routes_lock:
+                        route_peer_id = client_request_routes.get(request_id)
+
+                    if route_peer_id is not None:
+                        with peers_lock:
+                            route_socket = peers.get(route_peer_id)
+
+                        if route_socket is not None:
+                            try:
+                                send_json(
+                                    route_socket,
+                                    {
+                                        "type": "list_clients_response",
+                                        "request_id": request_id,
+                                        "clients": clients_from_peer,
+                                    },
+                                )
+                            except OSError:
+                                pass
 
                 continue
 
             if message.get("type") == "list_clients_request":
                 request_id = message.get("request_id")
                 visited = message.get("visited", [])
+
+                with client_request_routes_lock:
+                    client_request_routes[request_id] = peer_id
+
+                if get_own_server_id() not in visited:
+                    visited = visited + [get_own_server_id()]
 
                 send_json(
                     peer_socket,
@@ -730,9 +764,6 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                         "clients": local_client_names(get_own_server_id()),
                     },
                 )
-
-                if get_own_server_id() not in visited:
-                    visited = visited + [get_own_server_id()]
 
                 with peers_lock:
                     peer_items = list(peers.items())
@@ -758,6 +789,9 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
             if message.get("type") == "list_peers_request":
                 request_id = message.get("request_id")
                 visited = message.get("visited", [])
+
+                with peer_request_routes_lock:
+                    peer_request_routes[request_id] = peer_id
 
                 send_json(
                     peer_socket,
@@ -796,9 +830,33 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                 request_id = message.get("request_id")
                 peers_from_peer = message.get("peers", [])
 
+                handled_locally = False
+
                 with pending_peer_list_lock:
                     if request_id in pending_peer_list_requests:
                         pending_peer_list_requests[request_id].extend(peers_from_peer)
+                        handled_locally = True
+
+                if not handled_locally:
+                    with peer_request_routes_lock:
+                        route_peer_id = peer_request_routes.get(request_id)
+
+                    if route_peer_id is not None:
+                        with peers_lock:
+                            route_socket = peers.get(route_peer_id)
+
+                        if route_socket is not None:
+                            try:
+                                send_json(
+                                    route_socket,
+                                    {
+                                        "type": "list_peers_response",
+                                        "request_id": request_id,
+                                        "peers": peers_from_peer,
+                                    },
+                                )
+                            except OSError:
+                                pass
 
                 continue
 
