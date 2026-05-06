@@ -36,6 +36,8 @@ own_server_id = None
 own_listen_port = None
 seen_origins = set()
 seen_origins_lock = threading.Lock()
+pending_peer_list_requests = {}
+pending_peer_list_lock = threading.Lock()
 
 
 def usage_error() -> None:
@@ -257,34 +259,25 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
         if message.get("type") == "hello_server":
             peer_id = message.get("serverid")
 
+            # prevent self connection
             if peer_id == server_id:
-                send_json(
-                    client_socket,
-                    {
-                        "type": "hello_server_ack",
-                        "serverid": server_id,
-                    },
-                )
+                send_json(client_socket, {"type": "hello_server_ack", "serverid": server_id})
                 client_socket.close()
                 return
 
-            send_json(
-                client_socket,
-                {
-                    "type": "hello_server_ack",
-                    "serverid": server_id,
-                },
-            )
-
-            client_socket.settimeout(None)
-
+            # duplicate check BEFORE storing
             with peers_lock:
                 if peer_id in peers:
-                    try:
-                        peers[peer_id].close()
-                    except OSError:
-                        pass
+                    send_json(client_socket, {"type": "hello_server_ack", "serverid": server_id})
+                    client_socket.close()
+                    return
 
+            # send ACK ONCE
+            send_json(client_socket, {"type": "hello_server_ack", "serverid": server_id})
+            client_socket.settimeout(None)
+
+            # store AFTER validation
+            with peers_lock:
                 peers[peer_id] = client_socket
 
             print(f'pubsubserver: Connection received from peer "{peer_id}"', flush=True)
@@ -391,9 +384,6 @@ def handle_connection(client_socket: socket.socket, server_id: str) -> None:
                         pass
                     continue
 
-                with clients_lock:
-                    targets = matching_client_sockets(topic, None, file_mode=True)
-
                 deliver_file_to_local_clients(
                     topic,
                     next_message.get("filename"),
@@ -471,6 +461,10 @@ def local_client_names(server_id: str) -> list[str]:
     """Return local client names as serverid:clientid."""
     with clients_lock:
         return [f"{server_id}:{client_id}" for client_id in clients.keys()]
+    
+def local_peer_names() -> list[str]:
+    with peers_lock:
+        return sorted(peers.keys())
 
 def request_clients_from_peers(request_id: str) -> None:
     """Ask all direct peers for their local client names."""
@@ -478,6 +472,7 @@ def request_clients_from_peers(request_id: str) -> None:
         {
             "type": "list_clients_request",
             "request_id": request_id,
+            "visited": [get_own_server_id()],
         }
     )
 
@@ -543,8 +538,30 @@ def server_stdin_loop(server_id: str) -> None:
                 )
                 continue
 
-            with peers_lock:
-                peer_ids = sorted(peers.keys())
+            peer_ids = local_peer_names()
+
+            if len(args) == 2 and args[1] == "--all":
+                request_id = f"{server_id}:peers:{time.time_ns()}"
+
+                with pending_peer_list_lock:
+                    pending_peer_list_requests[request_id] = []
+
+                forward_to_peers(
+                    {
+                        "type": "list_peers_request",
+                        "request_id": request_id,
+                        "visited": [server_id],
+                    }
+                )
+
+                time.sleep(0.25)
+
+                with pending_peer_list_lock:
+                    extra_peers = pending_peer_list_requests.pop(request_id, [])
+
+                peer_ids.extend(extra_peers)
+
+            peer_ids = sorted(set(peer_ids))
 
             if not peer_ids:
                 print("pubsubserver: No peer servers connected", flush=True)
@@ -691,17 +708,6 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                 forward_to_peers(message, except_peer_id=peer_id)
                 continue
 
-            if message.get("type") == "list_clients_request":
-                send_json(
-                    peer_socket,
-                    {
-                        "type": "list_clients_response",
-                        "request_id": message.get("request_id"),
-                        "clients": local_client_names(get_own_server_id()),
-                    },
-                )
-                continue
-
             if message.get("type") == "list_clients_response":
                 request_id = message.get("request_id")
                 clients_from_peer = message.get("clients", [])
@@ -709,6 +715,90 @@ def handle_peer_connection(peer_socket: socket.socket, peer_id: str) -> None:
                 with pending_client_list_lock:
                     if request_id in pending_client_list_requests:
                         pending_client_list_requests[request_id].extend(clients_from_peer)
+
+                continue
+
+            if message.get("type") == "list_clients_request":
+                request_id = message.get("request_id")
+                visited = message.get("visited", [])
+
+                send_json(
+                    peer_socket,
+                    {
+                        "type": "list_clients_response",
+                        "request_id": request_id,
+                        "clients": local_client_names(get_own_server_id()),
+                    },
+                )
+
+                if get_own_server_id() not in visited:
+                    visited = visited + [get_own_server_id()]
+
+                with peers_lock:
+                    peer_items = list(peers.items())
+
+                for next_peer_id, next_peer_socket in peer_items:
+                    if next_peer_id == peer_id or next_peer_id in visited:
+                        continue
+
+                    try:
+                        send_json(
+                            next_peer_socket,
+                            {
+                                "type": "list_clients_request",
+                                "request_id": request_id,
+                                "visited": visited,
+                            },
+                        )
+                    except OSError:
+                        pass
+
+                continue
+
+            if message.get("type") == "list_peers_request":
+                request_id = message.get("request_id")
+                visited = message.get("visited", [])
+
+                send_json(
+                    peer_socket,
+                    {
+                        "type": "list_peers_response",
+                        "request_id": request_id,
+                        "peers": local_peer_names(),
+                    },
+                )
+
+                if get_own_server_id() not in visited:
+                    visited = visited + [get_own_server_id()]
+
+                with peers_lock:
+                    peer_items = list(peers.items())
+
+                for next_peer_id, next_peer_socket in peer_items:
+                    if next_peer_id == peer_id or next_peer_id in visited:
+                        continue
+
+                    try:
+                        send_json(
+                            next_peer_socket,
+                            {
+                                "type": "list_peers_request",
+                                "request_id": request_id,
+                                "visited": visited,
+                            },
+                        )
+                    except OSError:
+                        pass
+
+                continue
+
+            if message.get("type") == "list_peers_response":
+                request_id = message.get("request_id")
+                peers_from_peer = message.get("peers", [])
+
+                with pending_peer_list_lock:
+                    if request_id in pending_peer_list_requests:
+                        pending_peer_list_requests[request_id].extend(peers_from_peer)
 
                 continue
 
