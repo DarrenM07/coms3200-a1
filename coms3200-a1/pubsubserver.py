@@ -147,18 +147,21 @@ def matching_client_sockets(topic: str, message: str | None = None, file_mode: b
         for subscription in subscriptions.get(subscriber_id, []):
             if subscription["topic"] != topic:
                 continue
+
             filter_data = subscription["filter"]
+
             if file_mode:
-                if filter_data is None:
-                    targets.append(sock)
-                    break
-                continue
+                targets.append(sock)
+                break
+
             if filter_data is None:
                 targets.append(sock)
                 break
+
             if message is not None and filter_matches_message(message, filter_data["operator"], filter_data["value"]):
                 targets.append(sock)
                 break
+
     return targets
 
 
